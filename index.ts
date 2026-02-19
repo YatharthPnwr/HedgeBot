@@ -31,12 +31,15 @@ type BotState =
 
 interface OrderRecord {
   orderId: string;
-  tokenId: string; // Which token this order is for
+  tokenId: string; // Which token this order is for (from getOrder().asset_id)
   side: Side;
-  size: number;
-  price: number;
+  originalSize: number; // The size we proposed (from getOrder().original_size)
+  sizeMatched: number; // The actual filled size (from getTrades() sum of sizes)
+  price: number; // The limit price we set (from getOrder().price) - NOT the execution price
+  avgFillPrice: number; // The actual weighted avg execution price (from getTrades().price)
+  totalCost: number; // The actual USDC cost (sum of trade.size * trade.price across all fills)
   status: string;
-  outcome: string; // "YES" or "NO" for clarity
+  outcome: string; // "Up" or "Down" (from getOrder().outcome)
 }
 
 interface BotContext {
@@ -122,6 +125,48 @@ function calculateHedgeSize(
 // ============================================================================
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================================
+// HELPER: GET ACTUAL FILL DETAILS FROM TRADES
+// getOrder().price = limit price (what we proposed)
+// getTrades().price = actual execution price (what was matched)
+// This function uses associate_trades from getOrder() to compute real metrics.
+// ============================================================================
+async function getActualFillDetails(
+  client: ClobClient,
+  associateTrades: string[],
+): Promise<{ totalSize: number; totalCost: number; avgFillPrice: number }> {
+  let totalSize = 0;
+  let totalCost = 0;
+
+  for (const tradeId of associateTrades) {
+    try {
+      const trades = await client.getTrades({ id: tradeId } as any);
+      if (trades && Array.isArray(trades) && trades.length > 0) {
+        for (const trade of trades) {
+          const tradeSize = parseFloat((trade as any).size) || 0;
+          const tradePrice = parseFloat((trade as any).price) || 0;
+          totalSize += tradeSize;
+          totalCost += tradeSize * tradePrice;
+          console.log(
+            `[FILL DETAILS] Trade ${tradeId}: ${tradeSize} shares @ $${tradePrice.toFixed(4)} = $${(tradeSize * tradePrice).toFixed(4)}`,
+          );
+        }
+      }
+    } catch (e) {
+      console.warn(`[FILL DETAILS] Could not fetch trade ${tradeId}:`, e);
+    }
+  }
+
+  const avgFillPrice = totalSize > 0 ? totalCost / totalSize : 0;
+
+  console.log(`[FILL DETAILS] Summary:`);
+  console.log(`[FILL DETAILS]   Total Size: ${totalSize} shares`);
+  console.log(`[FILL DETAILS]   Total Cost: $${totalCost.toFixed(4)}`);
+  console.log(`[FILL DETAILS]   Avg Fill Price: $${avgFillPrice.toFixed(4)}`);
+
+  return { totalSize, totalCost, avgFillPrice };
 }
 
 // ============================================================================
@@ -468,16 +513,19 @@ async function handlePlacingTraps(ctx: BotContext): Promise<BotState> {
 
       const order: OrderRecord = {
         orderId: response.orderID,
-        tokenId: param.tokenId, // Track which token
-        side: param.side,
-        size: param.size,
-        price: param.price,
+        tokenId: "", // Will be populated from getOrder() after fill
+        side: Side.BUY, // Will be populated from getOrder() after fill
+        originalSize: 0, // Will be populated from getOrder().original_size after fill
+        sizeMatched: 0, // Will be populated from getTrades() (actual filled qty) after fill
+        price: 0, // Will be populated from getOrder().price (limit price only) after fill
+        avgFillPrice: 0, // Will be populated from getTrades() (actual execution price) after fill
+        totalCost: 0, // Will be populated from getTrades() (actual USDC cost) after fill
         status: response.status,
-        outcome: param.outcome, // YES or NO
+        outcome: param.outcome, // YES or NO - we know this at placement time
       };
 
       console.log(
-        `[PLACING_TRAPS] Placed ${param.outcome} trap order: ${order.orderId} at $${param.price} x ${param.size}`,
+        `[PLACING_TRAPS] Placed ${param.outcome} trap order: ${order.orderId} (proposed $${param.price} x ${param.size})`,
       );
 
       return order;
@@ -573,6 +621,73 @@ async function handleWatching(ctx: BotContext): Promise<BotState> {
             console.log(
               `\n✅ [WATCHING] TRAP FILLED: ${trapOrder.outcome} Order! Status: ${orderStatus}`,
             );
+
+            // 🎯 CRITICAL: Populate OrderRecord with ACTUAL values from getOrder()
+            // These are the real values from the exchange, not what we proposed
+            const filledOrderData = order as any;
+            trapOrder.tokenId = filledOrderData.asset_id || "";
+            trapOrder.side =
+              filledOrderData.side?.toUpperCase() === "SELL"
+                ? Side.SELL
+                : Side.BUY;
+            trapOrder.originalSize =
+              parseFloat(filledOrderData.original_size) || 0;
+            trapOrder.sizeMatched =
+              parseFloat(filledOrderData.size_matched) || 0;
+            trapOrder.price = parseFloat(filledOrderData.price) || 0;
+            trapOrder.status = orderStatus;
+            trapOrder.outcome = filledOrderData.outcome || trapOrder.outcome;
+
+            console.log(
+              `[WATCHING] Limit price from getOrder(): $${trapOrder.price}`,
+            );
+            console.log(
+              `[WATCHING] Original size: ${trapOrder.originalSize}, Size matched: ${trapOrder.sizeMatched}`,
+            );
+
+            // CRITICAL: getOrder().price is the LIMIT price, NOT the execution price.
+            // Use associate_trades -> getTrades() to get ACTUAL execution prices.
+            const associateTrades: string[] =
+              filledOrderData.associate_trades || [];
+            if (associateTrades.length > 0) {
+              console.log(
+                `[WATCHING] Found ${associateTrades.length} associated trades. Fetching actual fill details...`,
+              );
+              const fillDetails = await getActualFillDetails(
+                ctx.client,
+                associateTrades,
+              );
+              trapOrder.sizeMatched =
+                fillDetails.totalSize > 0
+                  ? fillDetails.totalSize
+                  : trapOrder.sizeMatched;
+              trapOrder.avgFillPrice = fillDetails.avgFillPrice;
+              trapOrder.totalCost = fillDetails.totalCost;
+            } else {
+              console.warn(
+                `[WATCHING] No associate_trades found. Falling back to getOrder() limit price.`,
+              );
+              trapOrder.avgFillPrice = trapOrder.price;
+              trapOrder.totalCost = trapOrder.sizeMatched * trapOrder.price;
+            }
+
+            console.log(`[WATCHING] ACTUAL fill details (from getTrades()):`);
+            console.log(`[WATCHING]   Token ID: ${trapOrder.tokenId}`);
+            console.log(`[WATCHING]   Side: ${trapOrder.side}`);
+            console.log(
+              `[WATCHING]   Size Matched: ${trapOrder.sizeMatched} shares`,
+            );
+            console.log(
+              `[WATCHING]   Limit Price: $${trapOrder.price} (what we proposed)`,
+            );
+            console.log(
+              `[WATCHING]   Avg Fill Price: $${trapOrder.avgFillPrice.toFixed(4)} (actual execution)`,
+            );
+            console.log(
+              `[WATCHING]   Total Cost: $${trapOrder.totalCost.toFixed(4)} (actual USDC spent)`,
+            );
+            console.log(`[WATCHING]   Outcome: ${trapOrder.outcome}`);
+
             ctx.filledOrder = trapOrder;
             ctx.filledTokenId = trapOrder.tokenId;
             ctx.oppositeTokenId =
@@ -631,17 +746,18 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
 
   try {
     // Step 0: Record actual investment now that order is filled
-    const trapCost = ctx.filledOrder.size * ctx.filledOrder.price;
+    // Using totalCost from getTrades() - the actual USDC spent, not limit price
+    const trapCost = ctx.filledOrder.totalCost;
     metrics.totalInvested += trapCost;
 
     console.log(
-      `[HEDGING] ✅ Trap order filled! Recording investment: ${ctx.filledOrder.size} shares @ $${ctx.filledOrder.price} = $${trapCost.toFixed(2)}`,
+      `[HEDGING] Trap order filled! Recording investment: ${ctx.filledOrder.sizeMatched} shares @ avg $${ctx.filledOrder.avgFillPrice.toFixed(4)} = $${trapCost.toFixed(4)} (limit was $${ctx.filledOrder.price})`,
     );
 
     // Step 1: Calculate hedge size before fetching prices
     const initialCost = trapCost;
     console.log(
-      `[HEDGING] Initial cost: ${ctx.filledOrder.size} shares @ $${ctx.filledOrder.price} = $${initialCost.toFixed(2)}`,
+      `[HEDGING] Initial cost (actual from trades): $${initialCost.toFixed(4)}`,
     );
 
     // Step 2: Fetch market info using conditionId to get token prices
@@ -786,14 +902,50 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
           ) {
             hedgeFilled = true;
             const filledAmount =
-              (hedgeDetails as any).size_matched ||
-              (hedgeDetails as any).filled ||
-              (hedgeDetails as any).filledAmount ||
-              hedgeSize;
+              (hedgeDetails as any).size_matched || hedgeSize;
             actualHedgeFilled = parseFloat(filledAmount) || hedgeSize;
-            console.log(
-              `[HEDGING] ✅ HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares`,
-            );
+
+            // Get actual hedge execution price from trades
+            const hedgeAssociateTrades: string[] =
+              (hedgeDetails as any).associate_trades || [];
+            if (hedgeAssociateTrades.length > 0) {
+              console.log(
+                `[HEDGING] Fetching actual hedge fill details from ${hedgeAssociateTrades.length} trades...`,
+              );
+              const hedgeFillDetails = await getActualFillDetails(
+                ctx.client,
+                hedgeAssociateTrades,
+              );
+              if (hedgeFillDetails.totalSize > 0) {
+                actualHedgeFilled = hedgeFillDetails.totalSize;
+                ctx.hedgePrice = hedgeFillDetails.avgFillPrice;
+                ctx.hedgeSize = actualHedgeFilled;
+                console.log(
+                  `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}!`,
+                );
+                console.log(
+                  `[HEDGING]   Actual size: ${actualHedgeFilled} shares`,
+                );
+                console.log(
+                  `[HEDGING]   Avg fill price: $${ctx.hedgePrice.toFixed(4)} (market was $${currentPrice})`,
+                );
+                console.log(
+                  `[HEDGING]   Total hedge cost: $${hedgeFillDetails.totalCost.toFixed(4)}`,
+                );
+              } else {
+                ctx.hedgeSize = actualHedgeFilled;
+                ctx.hedgePrice = currentPrice;
+                console.log(
+                  `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares (trades returned no data, using market price $${currentPrice})`,
+                );
+              }
+            } else {
+              ctx.hedgeSize = actualHedgeFilled;
+              ctx.hedgePrice = currentPrice;
+              console.log(
+                `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares (no associate_trades, using market price $${currentPrice})`,
+              );
+            }
             break;
           }
         }
@@ -845,7 +997,7 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
           {
             tokenID: ctx.filledTokenId!,
             price: aggressiveSellPrice,
-            size: ctx.filledOrder!.size,
+            size: ctx.filledOrder!.sizeMatched,
             side: Side.SELL,
           },
           {
@@ -858,27 +1010,26 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
         console.log(`[HEDGING] Trap sold! Order ID: ${sellOrder.orderID}`);
 
         // Fetch actual trap sell fill amount
-        let actualTrapSold = ctx.filledOrder!.size;
+        let actualTrapSold = ctx.filledOrder!.sizeMatched;
         try {
           const trapSellDetails = await ctx.client.getOrder(sellOrder.orderID);
           if (trapSellDetails) {
             const filledAmount =
-              (trapSellDetails as any).filled ||
-              (trapSellDetails as any).filledAmount ||
-              ctx.filledOrder!.size;
+              parseFloat((trapSellDetails as any).size_matched) ||
+              ctx.filledOrder!.sizeMatched;
             actualTrapSold = filledAmount;
             console.log(
-              `[HEDGING] ✅ Actual trap sold: ${actualTrapSold} shares (requested ${ctx.filledOrder!.size})`,
+              `[HEDGING] ✅ Actual trap sold: ${actualTrapSold} shares (requested ${ctx.filledOrder!.sizeMatched})`,
             );
           }
         } catch (e) {
           console.warn(
-            "[HEDGING] Could not fetch trap sell fill details, using requested size",
+            "[HEDGING] Could not fetch trap sell fill details, using sizeMatched",
           );
         }
 
-        // Calculate loss/proceeds using actual filled amounts
-        const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
+        // Calculate loss/proceeds using actual filled amounts (totalCost from trades)
+        const trapCost = ctx.filledOrder!.totalCost;
         const trapProceeds = actualTrapSold * aggressiveSellPrice;
         const loss = trapCost - trapProceeds;
 
@@ -898,7 +1049,7 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
 
           📊 <b>EXIT DETAILS</b>
           ━━━━━━━━━━━━━━━━━━━━━━━━━━
-          Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
+          Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder?.sizeMatched} = $${trapCost.toFixed(2)}
           Trap Exit: ${ctx.filledOrder?.outcome} @ $${aggressiveSellPrice.toFixed(2)} x ${actualTrapSold} (ACTUAL FILLED) = $${trapProceeds.toFixed(2)}
 
           ⚠️ <b>Loss: -$${loss.toFixed(2)}</b>
@@ -914,24 +1065,23 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
       return "DONE";
     }
 
-    // Store hedge details for profit taking
-    ctx.hedgeSize = hedgeSize;
-    ctx.hedgePrice = hedgePrice;
+    // ctx.hedgeSize and ctx.hedgePrice are already set from getTrades() in the fill detection block above
+    // No need to overwrite with calculated/market values
 
-    // 🎯 CRITICAL: Wait for token settlement before placing sell orders
+    // Wait for token settlement before placing sell orders
     console.log(
-      "[HEDGING] ⏳ Waiting 2 seconds for hedge tokens to settle in wallet...",
+      "[HEDGING] Waiting 4 seconds for hedge tokens to settle in wallet...",
     );
     await sleep(4000);
 
     // Send Telegram notification with actual costs and fills
-    const hedgeCost = ctx.hedgeSize * hedgePrice;
+    const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
     await sendTelegramMessage(
       `
         ✅ <b>TRAP FILLED & HEDGE PLACED</b>
         ━━━━━━━━━━━━━━━━━━━━━━━━━━
-        💰 Trap Entry: ${ctx.filledOrder.outcome} @ $${ctx.filledOrder.price} x ${ctx.filledOrder.size} = $${trapCost.toFixed(2)}
-        🛡️ Hedge Entry: ${ctx.oppositeTokenId === ctx.yesTokenId ? "YES" : "NO"} @ $${hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (ACTUAL FILLED) = $${hedgeCost.toFixed(2)}
+        💰 Trap Entry: ${ctx.filledOrder.outcome} @ $${ctx.filledOrder.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder.sizeMatched} = $${trapCost.toFixed(4)}
+        🛡️ Hedge Entry: ${ctx.oppositeTokenId === ctx.yesTokenId ? "YES" : "NO"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize} = $${hedgeCost.toFixed(4)}
 
         💵 Total Invested: $${(trapCost + hedgeCost).toFixed(2)}
         🎯 Expected Profit: <b>+$${CONFIG.MIN_PROFIT_USD.toFixed(2)}</b>
@@ -957,8 +1107,8 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
   }
 
   const EXIT_PRICE = 0.98;
-  const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
-  const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
+  const trapCost = ctx.filledOrder!.totalCost; // Actual USDC spent (from getTrades)
+  const hedgeCost = ctx.hedgeSize * ctx.hedgePrice; // Actual hedge cost (hedgePrice from getTrades)
 
   console.log(
     "\n[PROFIT_TAKING] 📋 Placing limit orders to exit both positions",
@@ -1013,7 +1163,7 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
 
     // Place sell limit order for trap token @ 0.98
     console.log(
-      `[PROFIT_TAKING] Placing trap sell limit order (${ctx.filledOrder!.size} @ $${EXIT_PRICE})...`,
+      `[PROFIT_TAKING] Placing trap sell limit order (${ctx.filledOrder!.sizeMatched} @ $${EXIT_PRICE})...`,
     );
     let trapSellOrderId: string | undefined;
     try {
@@ -1021,7 +1171,7 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
         {
           tokenID: ctx.filledTokenId!,
           price: EXIT_PRICE,
-          size: ctx.filledOrder!.size,
+          size: ctx.filledOrder!.sizeMatched,
           side: Side.SELL,
         },
         {
@@ -1100,8 +1250,7 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
               await ctx.client.getOrder(hedgeSellOrderId);
             if (hedgeSellDetails) {
               const filledAmount =
-                (hedgeSellDetails as any).filled ||
-                (hedgeSellDetails as any).filledAmount ||
+                parseFloat((hedgeSellDetails as any).size_matched) ||
                 ctx.hedgeSize;
               actualHedgeSellFilled = filledAmount;
               console.log(
@@ -1145,8 +1294,8 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
 
 💹 <b>EXIT ANALYSIS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
-Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (requested) = $${hedgeCost.toFixed(2)}
+Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder?.sizeMatched} = $${trapCost.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
 Hedge Exit: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${EXIT_PRICE} x ${actualHedgeSellFilled} (ACTUAL FILLED) = $${saleProceeds.toFixed(2)}
 
 ✅ <b>Realized Profit: +$${realizedProfit.toFixed(2)}</b>
@@ -1173,17 +1322,16 @@ Win Rate: ${((metrics.winCount / (metrics.winCount + metrics.lossCount)) * 100).
           console.log(`[PROFIT_TAKING] 🛡️ LOSS EXIT (Insurance)`);
 
           // Fetch actual trap sell fill amount
-          let actualTrapSellFilled = ctx.filledOrder!.size;
+          let actualTrapSellFilled = ctx.filledOrder!.sizeMatched;
           try {
             const trapSellDetails = await ctx.client.getOrder(trapSellOrderId);
             if (trapSellDetails) {
               const filledAmount =
-                (trapSellDetails as any).filled ||
-                (trapSellDetails as any).filledAmount ||
-                ctx.filledOrder!.size;
+                parseFloat((trapSellDetails as any).size_matched) ||
+                ctx.filledOrder!.sizeMatched;
               actualTrapSellFilled = filledAmount;
               console.log(
-                `[PROFIT_TAKING] ✅ Actual trap sold: ${actualTrapSellFilled} shares (requested ${ctx.filledOrder!.size})`,
+                `[PROFIT_TAKING] ✅ Actual trap sold: ${actualTrapSellFilled} shares (requested ${ctx.filledOrder!.sizeMatched})`,
               );
             }
           } catch (e) {
@@ -1225,8 +1373,8 @@ Exiting to minimize losses (Insurance triggered)
 
 📉 <b>EXIT ANALYSIS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
-Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (requested) = $${hedgeCost.toFixed(2)}
+Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder?.sizeMatched} = $${trapCost.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
 Trap Exit: ${ctx.filledOrder?.outcome} @ $${EXIT_PRICE} x ${actualTrapSellFilled} (ACTUAL FILLED) = $${trapProceeds.toFixed(2)}
 
 ${realizedLoss >= 0 ? "✅ Small Profit: +" : "⚠️ Loss: -"}$${Math.abs(realizedLoss).toFixed(2)}
@@ -1276,8 +1424,8 @@ Win Rate: ${((metrics.winCount / (metrics.winCount + metrics.lossCount)) * 100).
 15 minutes elapsed. Market did not reach $0.98.
 Orders cancelled. Check manually.
 
-Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
-Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
+Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder?.sizeMatched} = $${trapCost.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
       `.trim(),
     );
 
@@ -1305,7 +1453,7 @@ async function handleStopLoss(ctx: BotContext): Promise<BotState> {
       {
         tokenID: ctx.filledTokenId!, // Sell the token we bought
         price: 0.01, // Sell at minimal price to guarantee execution
-        size: ctx.filledOrder.size,
+        size: ctx.filledOrder.sizeMatched,
         side: Side.SELL,
       },
       {
@@ -1316,7 +1464,7 @@ async function handleStopLoss(ctx: BotContext): Promise<BotState> {
     );
 
     console.log(
-      `[STOP_LOSS] Sold ${ctx.filledOrder.size} shares. Order: ${response.orderID}`,
+      `[STOP_LOSS] Sold ${ctx.filledOrder.sizeMatched} shares. Order: ${response.orderID}`,
     );
     console.log(`[STOP_LOSS] Status: ${response.status}`);
 
