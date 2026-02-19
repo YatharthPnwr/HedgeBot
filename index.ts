@@ -12,10 +12,9 @@ dotenv.config();
 const CONFIG = {
   TRAP_PRICE: 0.4, // Price for initial limit orders (cheap liquidity traps)
   BASE_SIZE: 5, // Number of shares per trap order
-  MIN_PROFIT_USD: 1.0, // Target profit to secure during hedge
+  MIN_PROFIT_USD: 0.1, // Target profit to secure during hedge
   MAX_HEDGE_PRICE: 0.8, // Safety cap - abort if opposing side too expensive
-  WATCH_INTERVAL_MS: 1500, // Poll order status every 2 seconds
-  MARKET_POLL_TIMEOUT_MS: 30000, // Max time to wait for market resolution
+  WATCH_INTERVAL_MS: 1300, // Poll order status every 1.3 seconds
 };
 
 // ============================================================================
@@ -43,6 +42,8 @@ interface OrderRecord {
 interface BotContext {
   client: ClobClient;
   market: any;
+  conditionId: string; // Store condition ID for getMarket calls
+  lastConditionId: string; // Track last market's condition ID to prevent reinvestment
   yesTokenId: string; // Token ID for YES outcome
   noTokenId: string; // Token ID for NO outcome
   trapOrders: OrderRecord[];
@@ -107,7 +108,13 @@ function calculateHedgeSize(
     throw new Error("Hedge price must be less than 1.0");
   }
 
-  return Math.ceil((initialCost + targetProfit) / (1 - hedgePrice));
+  const calculatedSize = Math.ceil(
+    (initialCost + targetProfit) / (1 - hedgePrice),
+  );
+
+  // Polymarket minimum order size is 5 shares
+  const MIN_ORDER_SIZE = 5;
+  return Math.max(calculatedSize, MIN_ORDER_SIZE);
 }
 
 // ============================================================================
@@ -122,12 +129,16 @@ function sleep(ms: number): Promise<void> {
 // ============================================================================
 async function sendTelegramMessage(message: string): Promise<void> {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.warn("Telegram credentials not configured");
+    console.warn("⚠️ [TELEGRAM] Credentials not configured. Skipping message.");
+    console.warn(`   BOT_TOKEN: ${TELEGRAM_BOT_TOKEN ? "✓ Set" : "✗ Missing"}`);
+    console.warn(`   CHAT_ID: ${TELEGRAM_CHAT_ID ? "✓ Set" : "✗ Missing"}`);
     return;
   }
 
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    console.log("[TELEGRAM] Sending message...");
+
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -138,11 +149,15 @@ async function sendTelegramMessage(message: string): Promise<void> {
       }),
     });
 
-    if (!response.ok) {
-      console.error("Failed to send Telegram message:", await response.text());
+    if (response.ok) {
+      console.log("✅ [TELEGRAM] Message sent successfully!");
+    } else {
+      const errorText = await response.text();
+      console.error("❌ [TELEGRAM] Failed to send. Status:", response.status);
+      console.error("   Response:", errorText);
     }
   } catch (error) {
-    console.error("Error sending Telegram message:", error);
+    console.error("❌ [TELEGRAM] Error sending message:", error);
   }
 }
 
@@ -152,8 +167,7 @@ async function sendTradeNotification(
   trapSize: number,
   outcome: string,
 ): Promise<void> {
-  const invested = trapSize * trapPrice;
-  metrics.totalInvested += invested;
+  const potentialCost = trapSize * trapPrice;
 
   const message = `
 🎯 <b>TRAP PLACED</b>
@@ -162,11 +176,9 @@ async function sendTradeNotification(
 🎲 Outcome: <b>${outcome}</b>
 💰 Price: $${trapPrice.toFixed(2)}
 📈 Size: ${trapSize} shares
-💵 Invested: $${invested.toFixed(2)}
+💵 Potential Cost: $${potentialCost.toFixed(2)} (if filled)
 
-📊 Portfolio Stats:
-Total Invested: $${metrics.totalInvested.toFixed(2)}
-Total PnL: <b>${metrics.totalPnL >= 0 ? "+" : ""}$${metrics.totalPnL.toFixed(2)}</b>
+⏳ Waiting for order to be filled...
   `.trim();
 
   await sendTelegramMessage(message);
@@ -179,15 +191,15 @@ async function sendHedgeNotification(
 ): Promise<void> {
   const hedgeCost = hedgeSize * hedgePrice;
   const message = `
-🛡️ <b>HEDGE PLACED</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Hedge Price: $${hedgePrice.toFixed(2)}
-📈 Hedge Size: ${hedgeSize} shares
-💵 Hedge Cost: $${hedgeCost.toFixed(2)}
-🎯 Expected Profit: <b>+$${expectedProfit.toFixed(2)}</b>
+    🛡️ <b>HEDGE PLACED</b>
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    💰 Hedge Price: $${hedgePrice.toFixed(2)}
+    📈 Hedge Size: ${hedgeSize} shares
+    💵 Hedge Cost: $${hedgeCost.toFixed(2)}
+    🎯 Expected Profit: <b>+$${expectedProfit.toFixed(2)}</b>
 
-✅ Position is now DELTA-NEUTRAL
-PROFIT GUARANTEED in BOTH outcomes!
+    ✅ Position is now DELTA-NEUTRAL
+    PROFIT GUARANTEED in BOTH outcomes!
   `.trim();
 
   await sendTelegramMessage(message);
@@ -265,11 +277,12 @@ Total ROI: ${((metrics.totalPnL / (metrics.totalInvested || 1)) * 100).toFixed(1
 async function initializeClient() {
   const HOST = "https://clob.polymarket.com";
   const CHAIN_ID = 137; // Polygon mainnet
-  const signer = new Wallet(process.env.PRIVATE_KEY as string);
+  const signer = new Wallet(process.env.PRIVATE_KEY!);
 
   // Phase 1: Create minimal client to derive API credentials
   const tempClient = new ClobClient(HOST, CHAIN_ID, signer);
-  const userApiCreds = await tempClient.createOrDeriveApiKey();
+  const userApiCreds = await tempClient.deriveApiKey();
+  console.log("THE RESPONSE IS", userApiCreds);
 
   console.log("API Key:", userApiCreds.key);
   console.log("Secret:", userApiCreds.secret);
@@ -278,7 +291,9 @@ async function initializeClient() {
   // Phase 2: Reinitialize with full authentication
   // Signature types: 0 = EOA, 1 = POLY_PROXY, 2 = GNOSIS_SAFE
   const SIGNATURE_TYPE = 1; // Poly Proxy
-  const FUNDER_ADDRESS = signer.address; // For EOA, funder is your wallet
+
+  const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS; // For EOA, funder is your wallet
+  console.log("THE FUNDER ADDDRESS IS,", FUNDER_ADDRESS);
 
   const client = new ClobClient(
     HOST,
@@ -301,14 +316,64 @@ async function initializeClient() {
 async function handleStart(ctx: BotContext): Promise<BotState> {
   console.log("\n[START] Identifying current market...");
 
-  const market = await getMarketInfo("btc-updown-15m");
-  if (!market) {
-    console.error("[START] Failed to find market. Retrying...");
-    await sleep(5000);
-    return "START";
+  // 🔴 CRITICAL: Keep trying until we get a DIFFERENT market (not the same as last cycle)
+  let market = null;
+  let attempts = 0;
+  const maxAttempts = 200; // Try for up to ~1000 seconds (with 5sec retry interval)
+
+  while (!market || market.conditionId === ctx.lastConditionId) {
+    attempts++;
+
+    if (attempts > maxAttempts) {
+      console.error(
+        "[START] ❌ CRITICAL: Could not find a NEW market after many attempts. The market may not be rotating. Aborting.",
+      );
+      return "DONE"; // Exit the bot
+    }
+
+    market = await getMarketInfo("btc-updown-15m");
+
+    if (!market) {
+      console.error("[START] Failed to find market. Retrying in 5 seconds...");
+      await sleep(5000);
+      continue;
+    }
+
+    // Check if this is the SAME market as last cycle
+    if (market.conditionId === ctx.lastConditionId) {
+      console.warn(
+        `[START] ⚠️ Got same market again (conditionId: ${market.conditionId}). Retrying in 5 seconds...`,
+      );
+      await sleep(5000);
+      market = null; // Reset to trigger retry
+      continue;
+    }
+
+    // NEW market found!
+    console.log(`[START] ✅ Found NEW market!`);
+    console.log(`  Previous conditionId: ${ctx.lastConditionId}`);
+    console.log(`  Current conditionId: ${market.conditionId}`);
+    break;
   }
 
   ctx.market = market;
+
+  // 🔴 CRITICAL: Store this market's conditionId immediately to prevent reinvestment
+  ctx.lastConditionId = market.conditionId;
+  console.log(
+    `[START] 🔒 Locked market conditionId: ${ctx.lastConditionId} - Will not reinvest in this market`,
+  );
+
+  // Extract condition ID directly from market object
+  // Gamma API returns array of markets, first element contains conditionId at top level
+  if (market.conditionId) {
+    console.log("the market id is", market.conditionId);
+    ctx.conditionId = market.conditionId;
+  } else {
+    console.error("[START] Could not extract conditionId from market response");
+    await sleep(5000);
+    return "START";
+  }
 
   // Parse clobTokenIds from Gamma API response
   // clobTokenIds is a JSON string array: "[\"id1\", \"id2\"]"
@@ -328,8 +393,21 @@ async function handleStart(ctx: BotContext): Promise<BotState> {
   ctx.noTokenId = tokenIds[1]; // Second token = NO
 
   console.log(`[START] Found market: ${market.slug}`);
+  console.log(`[START] Condition ID: ${ctx.conditionId}`);
   console.log(`[START] YES Token ID: ${ctx.yesTokenId}`);
   console.log(`[START] NO Token ID: ${ctx.noTokenId}`);
+
+  // 🎯 WAIT 3 MINUTES before placing orders (market stabilization)
+  console.log(
+    "[START] ⏳ Waiting 3 minutes before placing traps (market stabilization)...",
+  );
+  for (let i = 90; i > 0; i--) {
+    if (i % 30 === 0 || i <= 5) {
+      console.log(`[START] ⏳ Waiting ${i} seconds before placing traps...`);
+    }
+    await sleep(1000);
+  }
+  console.log("[START] ✅ 3-minute wait complete. Ready to place traps.");
 
   // Cancel any stale orders from previous rounds
   try {
@@ -430,55 +508,109 @@ async function handlePlacingTraps(ctx: BotContext): Promise<BotState> {
 // ============================================================================
 async function handleWatching(ctx: BotContext): Promise<BotState> {
   console.log("[WATCHING] Monitoring orders for fills...");
+  console.log(
+    `[WATCHING] Trap Orders: YES=${ctx.trapOrders[0]?.orderId}, NO=${ctx.trapOrders[1]?.orderId}`,
+  );
 
   const startTime = Date.now();
-  while (Date.now() - startTime < CONFIG.MARKET_POLL_TIMEOUT_MS) {
+  const MAX_WATCH_TIME = 900000; // 15 minutes (full market duration)
+  let lastLogTime = startTime;
+
+  while (true) {
+    const elapsed = Date.now() - startTime;
+
+    // Safety timeout after 15 minutes
+    if (elapsed > MAX_WATCH_TIME) {
+      console.log(
+        `[WATCHING] ⏱️ Maximum watch time (${MAX_WATCH_TIME}ms) exceeded. Exiting watch state.`,
+      );
+      return "DONE";
+    }
+
     try {
+      let yesStatus = "UNKNOWN";
+      let noStatus = "UNKNOWN";
+      let filledOrder = null;
+
       // Poll each trap order individually
-      let anyFilled = false;
       for (const trapOrder of ctx.trapOrders) {
-        const order = await ctx.client.getOrder(trapOrder.orderId);
+        try {
+          const order = await ctx.client.getOrder(trapOrder.orderId);
 
-        if (order && order.status === "FILLED") {
-          ctx.filledOrder = trapOrder;
-          ctx.filledTokenId = trapOrder.tokenId;
-          // The opposite token is the one we need to hedge with
-          ctx.oppositeTokenId =
-            trapOrder.tokenId === ctx.yesTokenId
-              ? ctx.noTokenId
-              : ctx.yesTokenId;
-          console.log(
-            `[WATCHING] Trap order filled: ${trapOrder.orderId} (${trapOrder.outcome} @ $${trapOrder.price})`,
-          );
-          console.log(
-            `[WATCHING] Will hedge with opposite token (${trapOrder.outcome === "YES" ? "NO" : "YES"})`,
-          );
-          return "HEDGING";
-        }
+          if (!order) {
+            console.warn(`[WATCHING] Order not found: ${trapOrder.orderId}`);
+            continue;
+          }
 
-        if (
-          order &&
-          (order.status === "FILLED" || order.status === "CANCELED")
-        ) {
-          anyFilled = true;
+          // Log the complete order object for debugging
+          console.log(
+            `[WATCHING] [${trapOrder.outcome}] Full order response:`,
+            JSON.stringify(order, null, 2),
+          );
+
+          const orderStatus = order.status?.toUpperCase() || "UNKNOWN";
+
+          // Track status for logging
+          if (trapOrder.outcome === "YES") {
+            yesStatus = orderStatus;
+          } else {
+            noStatus = orderStatus;
+          }
+
+          console.log(
+            `[WATCHING] [${trapOrder.outcome}] Order ${trapOrder.orderId.slice(0, 8)}... status: ${orderStatus}`,
+          );
+
+          // Check if order is filled/matched/confirmed
+          // MATCHED = matched by operator, sent to executor
+          // MINED = mined into the chain
+          // CONFIRMED = achieved finality and was successful
+          if (
+            orderStatus === "MATCHED" ||
+            orderStatus === "MINED" ||
+            orderStatus === "CONFIRMED"
+          ) {
+            console.log(
+              `\n✅ [WATCHING] TRAP FILLED: ${trapOrder.outcome} Order! Status: ${orderStatus}`,
+            );
+            ctx.filledOrder = trapOrder;
+            ctx.filledTokenId = trapOrder.tokenId;
+            ctx.oppositeTokenId =
+              trapOrder.tokenId === ctx.yesTokenId
+                ? ctx.noTokenId
+                : ctx.yesTokenId;
+            return "HEDGING";
+          }
+
+          // If order failed or is retrying, log it
+          if (orderStatus === "FAILED") {
+            console.error(`❌ [WATCHING] Order FAILED: ${trapOrder.outcome}`);
+          }
+          if (orderStatus === "RETRYING") {
+            console.warn(`⚠️ [WATCHING] Order RETRYING: ${trapOrder.outcome}`);
+          }
+        } catch (err) {
+          console.error(
+            `[WATCHING] Error checking order ${trapOrder.orderId}:`,
+            err,
+          );
         }
       }
 
-      if (!anyFilled) {
+      // Log summary every 5 seconds
+      if (Date.now() - lastLogTime > 5000) {
         console.log(
-          `[WATCHING] Orders still open. Checking again in ${CONFIG.WATCH_INTERVAL_MS}ms...`,
+          `[WATCHING] [${Math.round(elapsed / 1000)}s] Status: YES=${yesStatus}, NO=${noStatus}`,
         );
+        lastLogTime = Date.now();
       }
 
       await sleep(CONFIG.WATCH_INTERVAL_MS);
     } catch (error) {
-      console.error("[WATCHING] Error fetching orders:", error);
+      console.error("[WATCHING] Error in watch loop:", error);
       await sleep(CONFIG.WATCH_INTERVAL_MS);
     }
   }
-
-  console.log("[WATCHING] Timeout waiting for trap to fill. Moving to DONE.");
-  return "DONE";
 }
 
 // ============================================================================
@@ -498,23 +630,41 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
   );
 
   try {
+    // Step 0: Record actual investment now that order is filled
+    const trapCost = ctx.filledOrder.size * ctx.filledOrder.price;
+    metrics.totalInvested += trapCost;
+
+    console.log(
+      `[HEDGING] ✅ Trap order filled! Recording investment: ${ctx.filledOrder.size} shares @ $${ctx.filledOrder.price} = $${trapCost.toFixed(2)}`,
+    );
+
     // Step 1: Calculate hedge size before fetching prices
-    const initialCost = ctx.filledOrder.size * ctx.filledOrder.price;
+    const initialCost = trapCost;
     console.log(
       `[HEDGING] Initial cost: ${ctx.filledOrder.size} shares @ $${ctx.filledOrder.price} = $${initialCost.toFixed(2)}`,
     );
 
-    // Step 2: Fetch current market prices for the OPPOSITE token (what we'll buy to hedge)
-    // CRITICAL: Must use oppositeTokenId, not filledTokenId!
-    // We need the price of the token we're about to buy, not the one we already own
-    const market = await ctx.client.getMarket(ctx.oppositeTokenId!);
-    console.log(
-      `[HEDGING] Current market for hedge token: Best Bid: $${market.bestBid}, Best Ask: $${market.bestAsk}`,
+    // Step 2: Fetch market info using conditionId to get token prices
+    const marketData = await ctx.client.getMarket(ctx.conditionId);
+    console.log(`[HEDGING] Market data fetched. Tokens:`, marketData.tokens);
+
+    // Find the hedge token in the market data
+    const hedgeToken = marketData.tokens.find(
+      (token: any) => token.token_id === ctx.oppositeTokenId,
     );
 
-    // Determine hedge price (ask price of the token we're buying)
-    // This is what we'll pay to buy the opposite token
-    const hedgePrice = market.bestAsk;
+    if (!hedgeToken) {
+      console.error(
+        `[HEDGING] Could not find hedge token ${ctx.oppositeTokenId} in market data`,
+      );
+      return "DONE";
+    }
+
+    const hedgePrice = hedgeToken.price;
+
+    console.log(
+      `[HEDGING] Current hedge token price: $${hedgePrice} (Outcome: ${hedgeToken.outcome})`,
+    );
 
     // Step 3: Safety check - if hedge price exceeds max, trigger stop loss
     if (hedgePrice > CONFIG.MAX_HEDGE_PRICE) {
@@ -539,65 +689,256 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
       `[HEDGING] Expected profit if hedge succeeds: $${CONFIG.MIN_PROFIT_USD.toFixed(2)}`,
     );
 
-    // Step 5: Cancel unfilled order and place hedge order in parallel
+    // Step 5: Cancel unfilled order first
     if (unfilledOrder) {
       console.log(
         `[HEDGING] Canceling unfilled order: ${unfilledOrder.orderId}`,
       );
+      try {
+        await ctx.client.cancelOrder({ orderID: unfilledOrder.orderId });
+        console.log(`[HEDGING] ✅ Unfilled order cancelled`);
+      } catch (e) {
+        console.warn("[HEDGING] Failed to cancel unfilled order:", e);
+      }
     }
 
-    const tasks = [];
-
-    // Cancel unfilled order
-    if (unfilledOrder) {
-      tasks.push(
-        ctx.client
-          .cancelOrder({ orderID: unfilledOrder.orderId })
-          .catch((e) => {
-            console.warn("[HEDGING] Failed to cancel unfilled order:", e);
-          }),
-      );
-    }
-
-    // Place hedge market order on the OPPOSITE token (CRITICAL FIX!)
-    // If we bought YES (token A), we must buy NO (token B) to hedge
+    // Place hedge order using FAK with RETRY LOOP until filled
+    // FAK = Fill-And-Kill - fills immediately or fails, no partial fills sitting on book
     const hedgeSide = Side.BUY;
-    const hedgeTokenId = ctx.oppositeTokenId!; // Use the opposite token
+    const hedgeTokenId = ctx.oppositeTokenId!;
+
+    let hedgeFilled = false;
+    let actualHedgeFilled = hedgeSize;
+    let hedgeAttempts = 0;
+    const MAX_HEDGE_ATTEMPTS = 30; // Try up to 30 times (about 60 seconds with 2s delays)
 
     console.log(
       `[HEDGING] Placing hedge order on opposite token: ${hedgeTokenId}`,
     );
-
-    const hedgeOrderTask = ctx.client.createAndPostOrder(
-      {
-        tokenID: hedgeTokenId, // HEDGE ON OPPOSITE TOKEN
-        price: hedgePrice + 0.05, // Slightly above ask to guarantee fill
-        size: hedgeSize,
-        side: hedgeSide,
-      },
-      {
-        tickSize: ctx.market.tickSize,
-        negRisk: ctx.market.negRisk,
-      },
-      OrderType.GTC,
+    console.log(
+      `[HEDGING] Using FAK ORDER with retry loop until filled (max ${MAX_HEDGE_ATTEMPTS} attempts)`,
     );
 
-    tasks.push(hedgeOrderTask);
+    while (!hedgeFilled && hedgeAttempts < MAX_HEDGE_ATTEMPTS) {
+      hedgeAttempts++;
 
-    // Execute both in parallel
-    const results = await Promise.all(tasks);
-    const hedgeResult = results[results.length - 1]; // Last result is the hedge order
+      try {
+        // Fetch fresh market price each attempt
+        const freshMarketData = await ctx.client.getMarket(ctx.conditionId);
+        const freshHedgeToken = freshMarketData.tokens.find(
+          (token: any) => token.token_id === hedgeTokenId,
+        );
 
-    ctx.hedgeOrderId = hedgeResult.orderID;
-    console.log(`[HEDGING] Hedge order placed: ${ctx.hedgeOrderId}`);
-    console.log(`[HEDGING] Hedge status: ${hedgeResult.status}`);
+        if (!freshHedgeToken) {
+          console.error(`[HEDGING] Could not find hedge token in market data`);
+          await sleep(2000);
+          continue;
+        }
+
+        const currentPrice = freshHedgeToken.price;
+        // Set aggressive buy price: current price + 15% buffer, capped at 0.95
+        const aggressiveHedgePrice = Math.min(
+          0.95,
+          Math.round((currentPrice + 0.15) * 100) / 100,
+        );
+
+        console.log(
+          `[HEDGING] Attempt ${hedgeAttempts}/${MAX_HEDGE_ATTEMPTS}: FAK market order for ${hedgeSize} shares (market price: $${currentPrice})`,
+        );
+
+        const hedgeResult = await ctx.client.createAndPostMarketOrder(
+          {
+            tokenID: hedgeTokenId,
+            amount: hedgeSize,
+            side: hedgeSide,
+          },
+          {
+            tickSize: ctx.market.tickSize,
+            negRisk: ctx.market.negRisk,
+          },
+          OrderType.FAK, // FAK = Fill-And-Kill (fills immediately or fails)
+        );
+
+        ctx.hedgeOrderId = hedgeResult.orderID;
+        console.log(
+          `[HEDGING] FAK order response - ID: ${hedgeResult.orderID}, Status: ${hedgeResult.status}`,
+        );
+
+        // Check if order was placed successfully
+        if (!hedgeResult.orderID) {
+          console.warn(`[HEDGING] ⚠️ No order ID returned, retrying...`);
+          await sleep(2000);
+          continue;
+        }
+
+        // Wait a moment for order to process, then check status
+        await sleep(1000);
+
+        const hedgeDetails = await ctx.client.getOrder(hedgeResult.orderID);
+        if (hedgeDetails) {
+          const status = hedgeDetails.status?.toUpperCase();
+          console.log(`[HEDGING] Order status after FAK: ${status}`);
+
+          if (
+            status === "MATCHED" ||
+            status === "MINED" ||
+            status === "CONFIRMED"
+          ) {
+            hedgeFilled = true;
+            const filledAmount =
+              (hedgeDetails as any).size_matched ||
+              (hedgeDetails as any).filled ||
+              (hedgeDetails as any).filledAmount ||
+              hedgeSize;
+            actualHedgeFilled = parseFloat(filledAmount) || hedgeSize;
+            console.log(
+              `[HEDGING] ✅ HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares`,
+            );
+            break;
+          }
+        }
+
+        // If not filled, wait and retry
+        console.log(`[HEDGING] Order not filled, retrying in 2 seconds...`);
+        await sleep(2000);
+      } catch (e: any) {
+        const errorMsg = e?.response?.data?.error || e?.message || String(e);
+        console.warn(`[HEDGING] Attempt ${hedgeAttempts} failed: ${errorMsg}`);
+        await sleep(2000);
+      }
+    }
+
+    // Store actual filled amount for later use
+    ctx.hedgeSize = actualHedgeFilled;
+
+    // CRITICAL: Verify hedge order actually filled
+    if (!hedgeFilled) {
+      console.error(
+        `[HEDGING] ❌ CRITICAL ERROR: Hedge order did not fill after ${MAX_HEDGE_ATTEMPTS} attempts! Selling trap immediately.`,
+      );
+
+      try {
+        // Fetch current market data to get trap token price
+        const marketData = await ctx.client.getMarket(ctx.conditionId);
+        const trapTokenData = marketData.tokens.find(
+          (token: any) => token.token_id === ctx.filledTokenId,
+        );
+
+        if (!trapTokenData) {
+          console.error("[HEDGING] Could not find trap token in market data");
+          return "DONE";
+        }
+
+        const trapBid = trapTokenData.price;
+        // Set aggressive sell price: current price - 10% buffer, minimum 0.01
+        // This ensures our sell order fills quickly
+        const aggressiveSellPrice = Math.max(
+          0.01,
+          Math.round((trapBid - 0.1) * 100) / 100,
+        );
+        console.log(
+          `[HEDGING] Selling trap token (${ctx.filledOrder?.outcome}) at aggressive price $${aggressiveSellPrice.toFixed(2)} (market: $${trapBid.toFixed(4)})...`,
+        );
+
+        // Sell trap order at aggressive price using GTC to ensure it stays on book
+        const sellOrder = await ctx.client.createAndPostOrder(
+          {
+            tokenID: ctx.filledTokenId!,
+            price: aggressiveSellPrice,
+            size: ctx.filledOrder!.size,
+            side: Side.SELL,
+          },
+          {
+            tickSize: ctx.market.tickSize,
+            negRisk: ctx.market.negRisk,
+          },
+          OrderType.GTC, // GTC = Good-Till-Cancelled (stays on book until filled)
+        );
+
+        console.log(`[HEDGING] Trap sold! Order ID: ${sellOrder.orderID}`);
+
+        // Fetch actual trap sell fill amount
+        let actualTrapSold = ctx.filledOrder!.size;
+        try {
+          const trapSellDetails = await ctx.client.getOrder(sellOrder.orderID);
+          if (trapSellDetails) {
+            const filledAmount =
+              (trapSellDetails as any).filled ||
+              (trapSellDetails as any).filledAmount ||
+              ctx.filledOrder!.size;
+            actualTrapSold = filledAmount;
+            console.log(
+              `[HEDGING] ✅ Actual trap sold: ${actualTrapSold} shares (requested ${ctx.filledOrder!.size})`,
+            );
+          }
+        } catch (e) {
+          console.warn(
+            "[HEDGING] Could not fetch trap sell fill details, using requested size",
+          );
+        }
+
+        // Calculate loss/proceeds using actual filled amounts
+        const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
+        const trapProceeds = actualTrapSold * aggressiveSellPrice;
+        const loss = trapCost - trapProceeds;
+
+        console.log(
+          `[HEDGING] ⚠️ Trap Entry: $${trapCost.toFixed(2)} | Exit: $${trapProceeds.toFixed(2)} | Loss: $${loss.toFixed(2)}`,
+        );
+
+        metrics.totalPnL -= loss;
+        metrics.lossCount++;
+
+        await sendTelegramMessage(
+          `
+          ❌ <b>HEDGE FAILED - EMERGENCY EXIT</b>
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+          🚨 Hedge order did not fill in time!
+          Sold trap position immediately to exit unhedged.
+
+          📊 <b>EXIT DETAILS</b>
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
+          Trap Exit: ${ctx.filledOrder?.outcome} @ $${aggressiveSellPrice.toFixed(2)} x ${actualTrapSold} (ACTUAL FILLED) = $${trapProceeds.toFixed(2)}
+
+          ⚠️ <b>Loss: -$${loss.toFixed(2)}</b>
+                  `.trim(),
+        );
+      } catch (error) {
+        console.error(
+          "[HEDGING] Error selling trap after hedge failure:",
+          error,
+        );
+      }
+
+      return "DONE";
+    }
 
     // Store hedge details for profit taking
     ctx.hedgeSize = hedgeSize;
     ctx.hedgePrice = hedgePrice;
 
-    // Send Telegram notification
-    await sendHedgeNotification(hedgePrice, hedgeSize, CONFIG.MIN_PROFIT_USD);
+    // 🎯 CRITICAL: Wait for token settlement before placing sell orders
+    console.log(
+      "[HEDGING] ⏳ Waiting 2 seconds for hedge tokens to settle in wallet...",
+    );
+    await sleep(4000);
+
+    // Send Telegram notification with actual costs and fills
+    const hedgeCost = ctx.hedgeSize * hedgePrice;
+    await sendTelegramMessage(
+      `
+        ✅ <b>TRAP FILLED & HEDGE PLACED</b>
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━
+        💰 Trap Entry: ${ctx.filledOrder.outcome} @ $${ctx.filledOrder.price} x ${ctx.filledOrder.size} = $${trapCost.toFixed(2)}
+        🛡️ Hedge Entry: ${ctx.oppositeTokenId === ctx.yesTokenId ? "YES" : "NO"} @ $${hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (ACTUAL FILLED) = $${hedgeCost.toFixed(2)}
+
+        💵 Total Invested: $${(trapCost + hedgeCost).toFixed(2)}
+        🎯 Expected Profit: <b>+$${CONFIG.MIN_PROFIT_USD.toFixed(2)}</b>
+
+        ✅ Position is now DELTA-NEUTRAL
+            `.trim(),
+    );
 
     return "PROFIT_TAKING";
   } catch (error) {
@@ -615,89 +956,198 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
     return "DONE";
   }
 
-  console.log(
-    "\n[PROFIT_TAKING] 🎯 Double-sided exit strategy: Monitoring BOTH tokens",
-  );
-  console.log(
-    `[PROFIT_TAKING]   • Hedge Token (${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"}): Will sell at $0.98 = 💰 PROFIT`,
-  );
-  console.log(
-    `[PROFIT_TAKING]   • Trap Token (${ctx.filledOrder?.outcome}): Will sell at $0.98 = ⚠️ LOSS (Insurance)`,
-  );
-
   const EXIT_PRICE = 0.98;
-  const startTime = Date.now();
-  const MAX_WAIT_MS = 15 * 60 * 1000; // Max 15 minutes (full market duration)
+  const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
+  const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
 
-  while (Date.now() - startTime < MAX_WAIT_MS) {
+  console.log(
+    "\n[PROFIT_TAKING] 📋 Placing limit orders to exit both positions",
+  );
+  console.log(
+    `[PROFIT_TAKING]   • Hedge Token (${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"}): Sell limit @ $${EXIT_PRICE} = 💰 PROFIT`,
+  );
+  console.log(
+    `[PROFIT_TAKING]   • Trap Token (${ctx.filledOrder?.outcome}): Sell limit @ $${EXIT_PRICE} = ⚠️ LOSS (Insurance)`,
+  );
+
+  try {
+    // 🎯 CRITICAL: Wait for token settlement before placing sell orders
+    console.log(
+      "[PROFIT_TAKING] ⏳ Waiting 10 seconds for tokens to settle before placing sell orders...",
+    );
+    await sleep(10000);
+
+    // Place sell limit order for hedge token @ 0.98
+    console.log(
+      `[PROFIT_TAKING] Placing hedge sell limit order (${ctx.hedgeSize} @ $${EXIT_PRICE})...`,
+    );
+    let hedgeSellOrderId: string | undefined;
     try {
-      // Fetch both token prices
-      const hedgeMarket = await ctx.client.getMarket(ctx.oppositeTokenId);
-      const trapMarket = await ctx.client.getMarket(ctx.filledTokenId!);
-
-      const hedgeBid = hedgeMarket.bestBid;
-      const trapBid = trapMarket.bestBid;
-
-      console.log(
-        `[PROFIT_TAKING] Hedge (${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"}): $${hedgeBid.toFixed(
-          4,
-        )} | Trap (${ctx.filledOrder?.outcome}): $${trapBid.toFixed(4)} | Target: $${EXIT_PRICE}`,
+      const hedgeSellOrder = await ctx.client.createAndPostOrder(
+        {
+          tokenID: ctx.oppositeTokenId,
+          price: EXIT_PRICE,
+          size: ctx.hedgeSize,
+          side: Side.SELL,
+        },
+        {
+          tickSize: ctx.market.tickSize,
+          negRisk: ctx.market.negRisk,
+        },
+        OrderType.GTC, // GTC = Good-Till-Cancelled (stays open until filled or market expires)
       );
 
-      // CONDITION A: Hedge token reaches $0.98 → PROFIT EXIT
-      if (hedgeBid >= EXIT_PRICE) {
-        console.log(
-          `\n[PROFIT_TAKING] ✅ CONDITION A: Hedge token bid $${hedgeBid.toFixed(
-            4,
-          )} >= $${EXIT_PRICE}`,
-        );
-        console.log(`[PROFIT_TAKING] 💰 PROFIT EXIT - Selling hedge token...`);
+      hedgeSellOrderId = hedgeSellOrder.orderID;
+      console.log(
+        `[PROFIT_TAKING] ✅ Hedge sell order placed: ${hedgeSellOrderId}`,
+      );
+    } catch (hedgeError: any) {
+      console.error(
+        `[PROFIT_TAKING] ❌ Hedge sell order FAILED:`,
+        hedgeError?.response?.data?.error || hedgeError?.message,
+      );
+    }
 
-        const sellOrder = await ctx.client.createAndPostOrder(
-          {
-            tokenID: ctx.oppositeTokenId,
-            price: hedgeBid - 0.01,
-            size: ctx.hedgeSize,
-            side: Side.SELL,
-          },
-          {
-            tickSize: ctx.market.tickSize,
-            negRisk: ctx.market.negRisk,
-          },
-          OrderType.GTC,
-        );
+    // Wait 10seconds more before placing trap sell
+    await sleep(10000);
 
-        const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
-        const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
-        const saleProceeds = ctx.hedgeSize * hedgeBid;
-        const realizedProfit = saleProceeds - trapCost - hedgeCost;
+    // Place sell limit order for trap token @ 0.98
+    console.log(
+      `[PROFIT_TAKING] Placing trap sell limit order (${ctx.filledOrder!.size} @ $${EXIT_PRICE})...`,
+    );
+    let trapSellOrderId: string | undefined;
+    try {
+      const trapSellOrder = await ctx.client.createAndPostOrder(
+        {
+          tokenID: ctx.filledTokenId!,
+          price: EXIT_PRICE,
+          size: ctx.filledOrder!.size,
+          side: Side.SELL,
+        },
+        {
+          tickSize: ctx.market.tickSize,
+          negRisk: ctx.market.negRisk,
+        },
+        OrderType.GTC, // GTC = Good-Till-Cancelled
+      );
 
-        console.log(
-          `[PROFIT_TAKING] Hedge sold! Order ID: ${sellOrder.orderID}`,
-        );
-        console.log(
-          `[PROFIT_TAKING] 💰 Realized Profit: +$${realizedProfit.toFixed(2)}`,
-        );
-        console.log(`[PROFIT_TAKING]   Trap cost: $${trapCost.toFixed(2)}`);
-        console.log(`[PROFIT_TAKING]   Hedge cost: $${hedgeCost.toFixed(2)}`);
-        console.log(
-          `[PROFIT_TAKING]   Sale proceeds: $${saleProceeds.toFixed(2)}`,
-        );
+      trapSellOrderId = trapSellOrder.orderID;
+      console.log(
+        `[PROFIT_TAKING] ✅ Trap sell order placed: ${trapSellOrderId}`,
+      );
+    } catch (trapError: any) {
+      console.error(
+        `[PROFIT_TAKING] ❌ Trap sell order FAILED:`,
+        trapError?.response?.data?.error || trapError?.message,
+      );
+    }
 
-        metrics.totalPnL += realizedProfit;
-        metrics.winCount++;
+    // Validate both orders were placed
+    if (!hedgeSellOrderId) {
+      console.error(
+        "[PROFIT_TAKING] ❌ CRITICAL: Hedge sell order failed. Cannot proceed.",
+      );
+      return "DONE";
+    }
 
-        await sendTelegramMessage(
-          `
+    if (!trapSellOrderId) {
+      console.error(
+        "[PROFIT_TAKING] ❌ CRITICAL: Trap sell order failed. Cannot proceed.",
+      );
+      return "DONE";
+    }
+
+    // Now poll for order fills
+    const startTime = Date.now();
+    const MAX_WAIT_MS = 15 * 60 * 1000; // Max 15 minutes
+    let lastLogTime = startTime;
+
+    while (Date.now() - startTime < MAX_WAIT_MS) {
+      try {
+        const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+
+        // Check hedge sell order status
+        const hedgeOrderStatus = await ctx.client.getOrder(hedgeSellOrderId);
+        const hedgeStatus = hedgeOrderStatus.status;
+
+        // Check trap sell order status
+        const trapOrderStatus = await ctx.client.getOrder(trapSellOrderId);
+        const trapStatus = trapOrderStatus.status;
+
+        // Log every 10 seconds instead of every 2 seconds to reduce spam
+        if (Date.now() - lastLogTime >= 10000) {
+          console.log(
+            `[PROFIT_TAKING] [${elapsedSeconds}s] Hedge: ${hedgeStatus} | Trap: ${trapStatus}`,
+          );
+          lastLogTime = Date.now();
+        }
+
+        // CONDITION A: Hedge sell order filled → PROFIT EXIT
+        if (
+          hedgeStatus === "MATCHED" ||
+          hedgeStatus === "MINED" ||
+          hedgeStatus === "CONFIRMED"
+        ) {
+          console.log(
+            `\n[PROFIT_TAKING] ✅ HEDGE SOLD! Status: ${hedgeStatus}`,
+          );
+          console.log(`[PROFIT_TAKING] 💰 PROFIT EXIT`);
+
+          // Fetch actual hedge sell fill amount
+          let actualHedgeSellFilled = ctx.hedgeSize;
+          try {
+            const hedgeSellDetails =
+              await ctx.client.getOrder(hedgeSellOrderId);
+            if (hedgeSellDetails) {
+              const filledAmount =
+                (hedgeSellDetails as any).filled ||
+                (hedgeSellDetails as any).filledAmount ||
+                ctx.hedgeSize;
+              actualHedgeSellFilled = filledAmount;
+              console.log(
+                `[PROFIT_TAKING] ✅ Actual hedge sold: ${actualHedgeSellFilled} shares (requested ${ctx.hedgeSize})`,
+              );
+            }
+          } catch (e) {
+            console.warn(
+              "[PROFIT_TAKING] Could not fetch hedge sell fill details",
+            );
+          }
+
+          const saleProceeds = actualHedgeSellFilled * EXIT_PRICE;
+          const realizedProfit = saleProceeds - trapCost - hedgeCost;
+
+          console.log(
+            `[PROFIT_TAKING] 💰 Realized Profit: +$${realizedProfit.toFixed(2)}`,
+          );
+          console.log(`[PROFIT_TAKING]   Trap cost: $${trapCost.toFixed(2)}`);
+          console.log(`[PROFIT_TAKING]   Hedge cost: $${hedgeCost.toFixed(2)}`);
+          console.log(
+            `[PROFIT_TAKING]   Sale proceeds: $${saleProceeds.toFixed(2)}`,
+          );
+
+          metrics.totalPnL += realizedProfit;
+          metrics.winCount++;
+
+          // Cancel trap sell order since we won't need it
+          try {
+            await ctx.client.cancelOrder({ orderID: trapSellOrderId });
+            console.log(`[PROFIT_TAKING] Cancelled trap sell order`);
+          } catch (e) {
+            console.log(`[PROFIT_TAKING] Could not cancel trap order`);
+          }
+
+          await sendTelegramMessage(
+            `
 💰 <b>PROFIT LOCKED - HEDGE EXIT</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 Hedge Token (${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"}) reached $${hedgeBid.toFixed(2)}
+🎯 Hedge Token (${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"}) sold @ $${EXIT_PRICE}
 
 💹 <b>EXIT ANALYSIS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
-Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
-Hedge Exit: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${hedgeBid.toFixed(2)} x ${ctx.hedgeSize} = $${saleProceeds.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (requested) = $${hedgeCost.toFixed(2)}
+Hedge Exit: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${EXIT_PRICE} x ${actualHedgeSellFilled} (ACTUAL FILLED) = $${saleProceeds.toFixed(2)}
 
 ✅ <b>Realized Profit: +$${realizedProfit.toFixed(2)}</b>
 
@@ -707,73 +1157,79 @@ Total Deployed: $${metrics.totalInvested.toFixed(2)}
 Total PnL: <b>${metrics.totalPnL >= 0 ? "+" : ""}$${metrics.totalPnL.toFixed(2)}</b>
 Wins: ${metrics.winCount} | Losses: ${metrics.lossCount}
 Win Rate: ${((metrics.winCount / (metrics.winCount + metrics.lossCount)) * 100).toFixed(1)}%
-        `.trim(),
-        );
+          `.trim(),
+          );
 
-        return "DONE";
-      }
+          return "DONE";
+        }
 
-      // CONDITION B: Trap token reaches $0.98 → LOSS EXIT (Insurance)
-      if (trapBid >= EXIT_PRICE) {
-        console.log(
-          `\n[PROFIT_TAKING] ⚠️ CONDITION B: Trap token bid $${trapBid.toFixed(
-            4,
-          )} >= $${EXIT_PRICE}`,
-        );
-        console.log(
-          `[PROFIT_TAKING] 🛡️ LOSS EXIT (Insurance) - Selling trap token to minimize losses...`,
-        );
+        // CONDITION B: Trap sell order filled → LOSS EXIT (Insurance)
+        if (
+          trapStatus === "MATCHED" ||
+          trapStatus === "MINED" ||
+          trapStatus === "CONFIRMED"
+        ) {
+          console.log(`\n[PROFIT_TAKING] ⚠️ TRAP SOLD! Status: ${trapStatus}`);
+          console.log(`[PROFIT_TAKING] 🛡️ LOSS EXIT (Insurance)`);
 
-        const sellOrder = await ctx.client.createAndPostOrder(
-          {
-            tokenID: ctx.filledTokenId!,
-            price: trapBid - 0.01,
-            size: ctx.filledOrder!.size,
-            side: Side.SELL,
-          },
-          {
-            tickSize: ctx.market.tickSize,
-            negRisk: ctx.market.negRisk,
-          },
-          OrderType.GTC,
-        );
+          // Fetch actual trap sell fill amount
+          let actualTrapSellFilled = ctx.filledOrder!.size;
+          try {
+            const trapSellDetails = await ctx.client.getOrder(trapSellOrderId);
+            if (trapSellDetails) {
+              const filledAmount =
+                (trapSellDetails as any).filled ||
+                (trapSellDetails as any).filledAmount ||
+                ctx.filledOrder!.size;
+              actualTrapSellFilled = filledAmount;
+              console.log(
+                `[PROFIT_TAKING] ✅ Actual trap sold: ${actualTrapSellFilled} shares (requested ${ctx.filledOrder!.size})`,
+              );
+            }
+          } catch (e) {
+            console.warn(
+              "[PROFIT_TAKING] Could not fetch trap sell fill details",
+            );
+          }
 
-        const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
-        const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
-        const trapProceeds = ctx.filledOrder!.size * trapBid;
-        const totalCost = trapCost + hedgeCost;
-        const realizedLoss = -(totalCost - trapProceeds);
+          const trapProceeds = actualTrapSellFilled * EXIT_PRICE;
+          const totalCost = trapCost + hedgeCost;
+          const realizedLoss = trapProceeds - totalCost;
 
-        console.log(
-          `[PROFIT_TAKING] Trap sold! Order ID: ${sellOrder.orderID}`,
-        );
-        console.log(
-          `[PROFIT_TAKING] ⚠️ Realized Loss: -$${Math.abs(realizedLoss).toFixed(2)}`,
-        );
-        console.log(`[PROFIT_TAKING]   Trap cost: $${trapCost.toFixed(2)}`);
-        console.log(`[PROFIT_TAKING]   Hedge cost: $${hedgeCost.toFixed(2)}`);
-        console.log(
-          `[PROFIT_TAKING]   Trap proceeds: $${trapProceeds.toFixed(2)}`,
-        );
+          console.log(
+            `[PROFIT_TAKING] ⚠️ Realized Loss: ${realizedLoss >= 0 ? "+" : ""}-$${Math.abs(realizedLoss).toFixed(2)}`,
+          );
+          console.log(`[PROFIT_TAKING]   Trap cost: $${trapCost.toFixed(2)}`);
+          console.log(`[PROFIT_TAKING]   Hedge cost: $${hedgeCost.toFixed(2)}`);
+          console.log(
+            `[PROFIT_TAKING]   Trap proceeds: $${trapProceeds.toFixed(2)}`,
+          );
 
-        metrics.totalPnL += realizedLoss;
-        metrics.lossCount++;
+          metrics.totalPnL += realizedLoss;
+          metrics.lossCount++;
 
-        await sendTelegramMessage(
-          `
+          // Cancel hedge sell order since trap triggered first
+          try {
+            await ctx.client.cancelOrder({ orderID: hedgeSellOrderId });
+            console.log(`[PROFIT_TAKING] Cancelled hedge sell order`);
+          } catch (e) {
+            console.log(`[PROFIT_TAKING] Could not cancel hedge order`);
+          }
+
+          await sendTelegramMessage(
+            `
 ⚠️ <b>LOSS MINIMIZED - TRAP EXIT</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 Trap Token (${ctx.filledOrder?.outcome}) reached $${trapBid.toFixed(2)}
+🎯 Trap Token (${ctx.filledOrder?.outcome}) sold @ $${EXIT_PRICE}
 Exiting to minimize losses (Insurance triggered)
 
 📉 <b>EXIT ANALYSIS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
-Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
-Trap Exit: ${ctx.filledOrder?.outcome} @ $${trapBid.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapProceeds.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} (requested) = $${hedgeCost.toFixed(2)}
+Trap Exit: ${ctx.filledOrder?.outcome} @ $${EXIT_PRICE} x ${actualTrapSellFilled} (ACTUAL FILLED) = $${trapProceeds.toFixed(2)}
 
-❌ <b>Realized Loss: -$${Math.abs(realizedLoss).toFixed(2)}</b>
-(Market moved against trap. Insurance hedge prevented larger loss!)
+${realizedLoss >= 0 ? "✅ Small Profit: +" : "⚠️ Loss: -"}$${Math.abs(realizedLoss).toFixed(2)}
 
 📊 <b>PORTFOLIO</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -781,55 +1237,55 @@ Total Deployed: $${metrics.totalInvested.toFixed(2)}
 Total PnL: <b>${metrics.totalPnL >= 0 ? "+" : ""}$${metrics.totalPnL.toFixed(2)}</b>
 Wins: ${metrics.winCount} | Losses: ${metrics.lossCount}
 Win Rate: ${((metrics.winCount / (metrics.winCount + metrics.lossCount)) * 100).toFixed(1)}%
-        `.trim(),
-        );
+            `.trim(),
+          );
 
-        return "DONE";
+          return "DONE";
+        }
+
+        // Both still pending, wait and check again
+        await sleep(2000);
+      } catch (err) {
+        console.error("[PROFIT_TAKING] Error checking order status:", err);
+        await sleep(2000);
       }
-
-      // Wait before checking again
-      await sleep(2000);
-    } catch (error) {
-      console.error("[PROFIT_TAKING] Error checking prices:", error);
-      await sleep(2000);
     }
-  }
 
-  // Timeout reached - sell at market anyway
-  console.log("[PROFIT_TAKING] ⏱️ Timeout reached. Selling at market...");
-  try {
-    const hedgeMarket = await ctx.client.getMarket(ctx.oppositeTokenId);
-    const sellOrder = await ctx.client.createAndPostOrder(
-      {
-        tokenID: ctx.oppositeTokenId,
-        price: hedgeMarket.bestBid - 0.01,
-        size: ctx.hedgeSize,
-        side: Side.SELL,
-      },
-      {
-        tickSize: ctx.market.tickSize,
-        negRisk: ctx.market.negRisk,
-      },
-      OrderType.GTC,
+    // Timeout reached - positions still open
+    const totalElapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+    console.error(
+      `[PROFIT_TAKING] ❌ TIMEOUT - ${totalElapsedSeconds}s elapsed (15min limit), positions still open`,
     );
-
     console.log(
-      `[PROFIT_TAKING] Timeout sale order placed: ${sellOrder.orderID}`,
+      `[PROFIT_TAKING] Final status - Hedge: ${hedgeSellOrderId} | Trap: ${trapSellOrderId}`,
+    );
+    console.log("[PROFIT_TAKING] Cancelling unfilled sell orders...");
+
+    try {
+      await ctx.client.cancelOrder({ orderID: hedgeSellOrderId });
+      await ctx.client.cancelOrder({ orderID: trapSellOrderId });
+      console.log("[PROFIT_TAKING] ✅ Orders cancelled successfully");
+    } catch (e) {
+      console.error("[PROFIT_TAKING] Error cancelling orders:", e);
+    }
+
+    await sendTelegramMessage(
+      `
+⏱️ <b>MARKET TIMEOUT - POSITIONS STILL OPEN</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+15 minutes elapsed. Market did not reach $0.98.
+Orders cancelled. Check manually.
+
+Trap Entry: ${ctx.filledOrder?.outcome} @ $${ctx.filledOrder?.price.toFixed(2)} x ${ctx.filledOrder?.size} = $${trapCost.toFixed(2)}
+Hedge Entry: ${ctx.filledOrder?.outcome === "YES" ? "NO" : "YES"} @ $${ctx.hedgePrice.toFixed(2)} x ${ctx.hedgeSize} = $${hedgeCost.toFixed(2)}
+      `.trim(),
     );
 
-    const trapCost = ctx.filledOrder!.size * ctx.filledOrder!.price;
-    const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
-    const saleProceeds = ctx.hedgeSize * hedgeMarket.bestBid;
-    const realizedProfit = saleProceeds - trapCost - hedgeCost;
-
-    metrics.totalPnL += realizedProfit;
-    metrics.winCount++;
+    return "DONE";
   } catch (error) {
-    console.error("[PROFIT_TAKING] Failed to sell at timeout:", error);
-    metrics.lossCount++;
+    console.error("[PROFIT_TAKING] Error during profit taking:", error);
+    return "DONE";
   }
-
-  return "DONE";
 }
 
 // ============================================================================
@@ -910,6 +1366,27 @@ async function handleDone(ctx: BotContext): Promise<BotState> {
 
   if (nextMarketReady) {
     console.log("[DONE] ✅ Next market is now active and ready!");
+
+    // 🔴 CRITICAL: Wait until we're truly in the NEXT 15-minute interval
+    // This prevents re-investing in the same market due to timing boundaries
+    console.log(
+      "[DONE] Ensuring we're past the current market interval boundary...",
+    );
+    const now = Math.floor(Date.now() / 1000);
+    const currentEpoch = Math.floor(now / 900) * 900; // Current 15-min boundary
+    const nextEpoch = currentEpoch + 900; // Next 15-min boundary
+    const waitUntil = (nextEpoch + 5) * 1000; // Wait until 5 seconds into next interval
+    const waitMs = Math.max(0, waitUntil - Date.now());
+
+    if (waitMs > 0) {
+      console.log(
+        `[DONE] Sleeping for ${Math.ceil(waitMs / 1000)} seconds to ensure next market interval...`,
+      );
+      await sleep(waitMs);
+    }
+    console.log(
+      "[DONE] ✅ Now safely in next market interval. Ready to start new cycle.",
+    );
   } else {
     console.warn("[DONE] Next market activation timeout. Retrying...");
   }
@@ -1092,6 +1569,8 @@ async function main() {
   const ctx: BotContext = {
     client,
     market: null,
+    conditionId: "",
+    lastConditionId: "", // Track last market to prevent reinvestment
     yesTokenId: "",
     noTokenId: "",
     trapOrders: [],
@@ -1116,6 +1595,7 @@ async function main() {
 
   // Main bot loop
   let cycleCount = 0;
+
   while (true) {
     cycleCount++;
     console.log(`\n${"=".repeat(80)}`);
@@ -1129,6 +1609,7 @@ async function main() {
       }
 
       // Reset for next cycle
+      ctx.conditionId = "";
       ctx.state = "START";
       ctx.trapOrders = [];
       ctx.filledOrder = null;
