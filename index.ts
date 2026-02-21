@@ -1,10 +1,72 @@
 import { ClobClient } from "@polymarket/clob-client";
-import { Wallet } from "ethers"; // v5.8.0
+import { Wallet, Contract, constants } from "ethers"; // v5.8.0
 import * as dotenv from "dotenv";
 import { Side } from "@polymarket/clob-client";
 import { OrderType } from "@polymarket/clob-client";
+import { AssetType } from "@polymarket/clob-client";
+import WebSocket from "ws";
+import axios from "axios";
 
 dotenv.config();
+
+// ============================================================================
+// CONTRACT ADDRESSES (Polygon Mainnet)
+// ============================================================================
+const POLYGON_CONTRACTS = {
+  exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+  negRiskExchange: "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+  negRiskAdapter: "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+  conditionalTokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+  collateral: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e
+};
+
+// Minimal ABI for ERC1155 setApprovalForAll
+const CTF_ABI = [
+  {
+    constant: false,
+    inputs: [
+      { name: "operator", type: "address" },
+      { name: "approved", type: "bool" },
+    ],
+    name: "setApprovalForAll",
+    outputs: [],
+    type: "function",
+  },
+  {
+    constant: true,
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "operator", type: "address" },
+    ],
+    name: "isApprovedForAll",
+    outputs: [{ name: "", type: "bool" }],
+    type: "function",
+  },
+];
+
+// Minimal ABI for ERC20 approve
+const ERC20_ABI = [
+  {
+    constant: false,
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    name: "approve",
+    outputs: [{ name: "", type: "bool" }],
+    type: "function",
+  },
+  {
+    constant: true,
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    name: "allowance",
+    outputs: [{ name: "", type: "uint256" }],
+    type: "function",
+  },
+];
 
 // ============================================================================
 // CONFIGURATION & CONSTANTS
@@ -12,9 +74,9 @@ dotenv.config();
 const CONFIG = {
   TRAP_PRICE: 0.4, // Price for initial limit orders (cheap liquidity traps)
   BASE_SIZE: 5, // Number of shares per trap order
-  MIN_PROFIT_USD: 0.1, // Target profit to secure during hedge
-  MAX_HEDGE_PRICE: 0.8, // Safety cap - abort if opposing side too expensive
-  WATCH_INTERVAL_MS: 1300, // Poll order status every 1.3 seconds
+  MIN_PROFIT_USD: 0.8, // Target profit to secure during hedge
+  MAX_HEDGE_PRICE: 0.84, // Safety cap - abort if opposing side too expensive
+  WATCH_INTERVAL_MS: 1200, // Poll order status every 1.3 seconds
 };
 
 // ============================================================================
@@ -42,6 +104,15 @@ interface OrderRecord {
   outcome: string; // "Up" or "Down" (from getOrder().outcome)
 }
 
+// WebSocket price cache for real-time hedge pricing
+interface PriceCache {
+  [tokenId: string]: {
+    bestBid: number;
+    bestAsk: number;
+    lastUpdate: number;
+  };
+}
+
 interface BotContext {
   client: ClobClient;
   market: any;
@@ -57,6 +128,9 @@ interface BotContext {
   hedgeSize: number; // Track hedge size for profit taking
   hedgePrice: number; // Track initial hedge price
   state: BotState;
+  // WebSocket for real-time price updates
+  priceWs: WebSocket | null;
+  priceCache: PriceCache;
 }
 
 // ============================================================================
@@ -128,45 +202,113 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ============================================================================
-// HELPER: GET ACTUAL FILL DETAILS FROM TRADES
-// getOrder().price = limit price (what we proposed)
-// getTrades().price = actual execution price (what was matched)
-// This function uses associate_trades from getOrder() to compute real metrics.
+// HELPER: GET POSITION DETAILS FROM POSITIONS API
+// Uses the Polymarket Data API to get current position details for a specific token.
+// This is more reliable than getTrades() which returns the entire trade (all participants).
+// API: GET https://data-api.polymarket.com/positions?user={address}&market={conditionId}
+// NOTE: Positions don't appear instantly - the API has a delay, so we poll with retries.
 // ============================================================================
-async function getActualFillDetails(
-  client: ClobClient,
-  associateTrades: string[],
-): Promise<{ totalSize: number; totalCost: number; avgFillPrice: number }> {
-  let totalSize = 0;
-  let totalCost = 0;
+async function getPositionDetails(
+  conditionId: string,
+  tokenId: string,
+  maxRetries: number = 4,
+  retryDelayMs: number = 2000,
+): Promise<{ size: number; avgPrice: number; totalCost: number } | null> {
+  const userAddress = process.env.FUNDER_ADDRESS;
 
-  for (const tradeId of associateTrades) {
+  if (!userAddress) {
+    console.error("[POSITION] FUNDER_ADDRESS not set in environment");
+    return null;
+  }
+
+  // Build URL with all required params (matching working curl command)
+  const url = new URL("https://data-api.polymarket.com/positions");
+  url.searchParams.set("user", userAddress);
+  url.searchParams.set("market", conditionId);
+  url.searchParams.set("sizeThreshold", "0"); // Include all positions, even tiny ones
+  url.searchParams.set("limit", "100");
+  url.searchParams.set("sortBy", "TOKENS");
+  url.searchParams.set("sortDirection", "DESC");
+
+  console.log(
+    `[POSITION] Fetching positions for user ${userAddress.slice(0, 10)}... market ${conditionId.slice(0, 10)}...`,
+  );
+  console.log(
+    `[POSITION] Will retry up to ${maxRetries} times with ${retryDelayMs}ms delay between attempts`,
+  );
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const trades = await client.getTrades({ id: tradeId } as any);
-      if (trades && Array.isArray(trades) && trades.length > 0) {
-        for (const trade of trades) {
-          const tradeSize = parseFloat((trade as any).size) || 0;
-          const tradePrice = parseFloat((trade as any).price) || 0;
-          totalSize += tradeSize;
-          totalCost += tradeSize * tradePrice;
-          console.log(
-            `[FILL DETAILS] Trade ${tradeId}: ${tradeSize} shares @ $${tradePrice.toFixed(4)} = $${(tradeSize * tradePrice).toFixed(4)}`,
-          );
-        }
+      console.log(`[POSITION] Attempt ${attempt}/${maxRetries}...`);
+
+      const response = await axios.get(url.toString());
+      const positions = response.data;
+
+      if (!Array.isArray(positions)) {
+        console.warn(`[POSITION] Invalid response format (not an array)`);
+        await sleep(retryDelayMs);
+        continue;
       }
-    } catch (e) {
-      console.warn(`[FILL DETAILS] Could not fetch trade ${tradeId}:`, e);
+
+      if (positions.length === 0) {
+        console.log(
+          `[POSITION] No positions yet, waiting ${retryDelayMs}ms before retry...`,
+        );
+        await sleep(retryDelayMs);
+        continue;
+      }
+
+      // Find the position matching our specific token (asset)
+      const position = positions.find((p: any) => p.asset === tokenId);
+
+      if (!position) {
+        console.log(
+          `[POSITION] Position for token ${tokenId.slice(0, 10)}... not found yet`,
+        );
+        console.log(
+          `[POSITION] Available positions:`,
+          positions.map((p: any) => ({
+            asset: p.asset?.slice(0, 10) + "...",
+            size: p.size,
+            outcome: p.outcome,
+          })),
+        );
+        await sleep(retryDelayMs);
+        continue;
+      }
+
+      // Found the position!
+      const size = parseFloat(position.size) || 0;
+      const avgPrice = parseFloat(position.avgPrice) || 0;
+      const totalCost = parseFloat(position.initialValue) || size * avgPrice;
+
+      console.log(
+        `[POSITION] Found position for token ${tokenId.slice(0, 10)}... on attempt ${attempt}:`,
+      );
+      console.log(`[POSITION]   Size: ${size} shares`);
+      console.log(`[POSITION]   Avg Price: $${avgPrice.toFixed(4)}`);
+      console.log(
+        `[POSITION]   Total Cost (initialValue): $${totalCost.toFixed(4)}`,
+      );
+      console.log(`[POSITION]   Outcome: ${position.outcome}`);
+      console.log(`[POSITION]   Total Bought: ${position.totalBought}`);
+
+      return { size, avgPrice, totalCost };
+    } catch (error: any) {
+      console.error(
+        `[POSITION] Error on attempt ${attempt}:`,
+        error.message || error,
+      );
+      if (attempt < maxRetries) {
+        await sleep(retryDelayMs);
+      }
     }
   }
 
-  const avgFillPrice = totalSize > 0 ? totalCost / totalSize : 0;
-
-  console.log(`[FILL DETAILS] Summary:`);
-  console.log(`[FILL DETAILS]   Total Size: ${totalSize} shares`);
-  console.log(`[FILL DETAILS]   Total Cost: $${totalCost.toFixed(4)}`);
-  console.log(`[FILL DETAILS]   Avg Fill Price: $${avgFillPrice.toFixed(4)}`);
-
-  return { totalSize, totalCost, avgFillPrice };
+  console.error(
+    `[POSITION] Failed to fetch position after ${maxRetries} attempts`,
+  );
+  return null;
 }
 
 // ============================================================================
@@ -184,25 +326,19 @@ async function sendTelegramMessage(message: string): Promise<void> {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     console.log("[TELEGRAM] Sending message...");
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: "HTML",
-      }),
+    const response = await axios.post(url, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: "HTML",
     });
 
-    if (response.ok) {
-      console.log("✅ [TELEGRAM] Message sent successfully!");
-    } else {
-      const errorText = await response.text();
-      console.error("❌ [TELEGRAM] Failed to send. Status:", response.status);
-      console.error("   Response:", errorText);
-    }
-  } catch (error) {
-    console.error("❌ [TELEGRAM] Error sending message:", error);
+    console.log("✅ [TELEGRAM] Message sent successfully!");
+  } catch (error: any) {
+    console.error(
+      "❌ [TELEGRAM] Failed to send. Status:",
+      error.response?.status,
+    );
+    console.error("   Response:", error.response?.data || error.message);
   }
 }
 
@@ -317,12 +453,109 @@ Total ROI: ${((metrics.totalPnL / (metrics.totalInvested || 1)) * 100).toFixed(1
 }
 
 // ============================================================================
+// PHASE 0: ENSURE APPROVALS FOR SELLING TOKENS
+// Polymarket requires TWO types of approvals:
+// 1. USDC allowance to Exchange (for BUY orders) - you likely have this
+// 2. Conditional Token approval (setApprovalForAll) to Exchange (for SELL orders)
+// Without #2, SELL orders will fail with "not enough balance / allowance"
+// ============================================================================
+async function ensureApprovals(
+  signer: Wallet,
+  isNegRisk: boolean = false,
+): Promise<void> {
+  console.log("\n[APPROVALS] Checking onchain approvals for selling tokens...");
+
+  // Connect signer to Polygon RPC (use env var or fallback to reliable public RPC)
+  const rpcUrl = process.env.RPC_URL || "https://rpc.ankr.com/polygon";
+  console.log(`[APPROVALS] Using RPC: ${rpcUrl}`);
+  const provider = new (await import("ethers")).providers.JsonRpcProvider(
+    rpcUrl,
+  );
+  const connectedSigner = signer.connect(provider);
+
+  const ctfContract = new Contract(
+    POLYGON_CONTRACTS.conditionalTokens,
+    CTF_ABI,
+    connectedSigner,
+  );
+
+  // Determine which exchange to approve based on market type
+  const exchangeAddress = isNegRisk
+    ? POLYGON_CONTRACTS.negRiskExchange
+    : POLYGON_CONTRACTS.exchange;
+
+  console.log(`[APPROVALS] Checking approval for Exchange: ${exchangeAddress}`);
+  console.log(
+    `[APPROVALS] CTF Contract: ${POLYGON_CONTRACTS.conditionalTokens}`,
+  );
+  console.log(
+    `[APPROVALS] Signer address: ${await connectedSigner.getAddress()}`,
+  );
+
+  try {
+    // Check if already approved
+    const isApproved = await ctfContract.isApprovedForAll(
+      await connectedSigner.getAddress(),
+      exchangeAddress,
+    );
+
+    console.log(`[APPROVALS] Current approval status: ${isApproved}`);
+
+    if (!isApproved) {
+      console.log(
+        "[APPROVALS] Setting approval for Exchange to transfer conditional tokens...",
+      );
+      const tx = await ctfContract.setApprovalForAll(exchangeAddress, true, {
+        gasPrice: 50_000_000_000, // 50 gwei
+        gasLimit: 100_000,
+      });
+      console.log(`[APPROVALS] Approval transaction sent: ${tx.hash}`);
+      console.log("[APPROVALS] Waiting for confirmation...");
+      await tx.wait();
+      console.log("[APPROVALS] Approval confirmed!");
+    } else {
+      console.log("[APPROVALS] Already approved - no action needed");
+    }
+
+    // Also check neg risk exchange if using standard exchange
+    if (!isNegRisk) {
+      const isNegRiskApproved = await ctfContract.isApprovedForAll(
+        await connectedSigner.getAddress(),
+        POLYGON_CONTRACTS.negRiskExchange,
+      );
+
+      if (!isNegRiskApproved) {
+        console.log("[APPROVALS] Setting approval for NegRisk Exchange...");
+        const tx = await ctfContract.setApprovalForAll(
+          POLYGON_CONTRACTS.negRiskExchange,
+          true,
+          {
+            gasPrice: 50_000_000_000,
+            gasLimit: 100_000,
+          },
+        );
+        console.log(`[APPROVALS] NegRisk approval transaction: ${tx.hash}`);
+        await tx.wait();
+        console.log("[APPROVALS] NegRisk approval confirmed!");
+      }
+    }
+  } catch (error) {
+    console.error("[APPROVALS] Error setting approval:", error);
+    throw error;
+  }
+}
+
+// ============================================================================
 // PHASE 1: CLIENT INITIALIZATION
 // ============================================================================
 async function initializeClient() {
   const HOST = "https://clob.polymarket.com";
   const CHAIN_ID = 137; // Polygon mainnet
   const signer = new Wallet(process.env.PRIVATE_KEY!);
+
+  // CRITICAL: Ensure approvals are set before trading
+  // This allows the Exchange to transfer our conditional tokens when selling
+  // await ensureApprovals(signer, false);
 
   // Phase 1: Create minimal client to derive API credentials
   const tempClient = new ClobClient(HOST, CHAIN_ID, signer);
@@ -351,8 +584,210 @@ async function initializeClient() {
 
   console.log("Client initialized successfully!");
 
+  // CRITICAL: Tell CLOB server to refresh its view of our allowances
+  // This syncs the on-chain approval status with the CLOB backend
+  try {
+    console.log("[INIT] Syncing allowances with CLOB server...");
+    await client.updateBalanceAllowance({
+      asset_type: AssetType.CONDITIONAL,
+    });
+    console.log("[INIT] Allowances synced successfully!");
+  } catch (error) {
+    console.warn(
+      "[INIT] Warning: Could not sync allowances with CLOB server:",
+      error,
+    );
+    // Don't throw - this is not critical for initialization
+  }
+
   // Now you can use `client` to place orders, check balances, etc.
   return client;
+}
+
+// ============================================================================
+// WEBSOCKET: Real-time price streaming for instant hedge pricing
+// Instead of polling getMarket() which has ~100-500ms latency,
+// we maintain a live WebSocket connection that streams price updates.
+// This gives us the most accurate price at the moment we need to hedge.
+// ============================================================================
+const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
+function startPriceWebSocket(ctx: BotContext): void {
+  if (ctx.priceWs) {
+    console.log("[WS] WebSocket already connected, skipping...");
+    return;
+  }
+
+  const tokenIds = [ctx.yesTokenId as string, ctx.noTokenId as string];
+  console.log("The token ids are", tokenIds);
+  if (tokenIds.length === 0) {
+    console.warn("[WS] No token IDs available, cannot start WebSocket");
+    return;
+  }
+
+  console.log(
+    `[WS] Connecting to Polymarket WebSocket for real-time prices...`,
+  );
+  // console.log(`[WS] Subscribing to tokens: ${tokenIds.join(",   ")}...`);
+
+  const ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    console.log("[WS] Connected! Subscribing to market updates...");
+
+    // Subscribe to both tokens with custom_feature_enabled for best_bid_ask events
+    ws.send(
+      JSON.stringify({
+        type: "market",
+        assets_ids: tokenIds,
+        custom_feature_enabled: true, // Enables best_bid_ask events
+      }),
+    );
+  });
+
+  ws.on("message", (data: WebSocket.Data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+
+      // Handle price_change events - these contain best_bid/best_ask for all tokens
+      if (msg.event_type === "price_change" && msg.price_changes) {
+        for (const change of msg.price_changes) {
+          // Each change has: asset_id, best_bid, best_ask, price, size, side
+          if (
+            change.asset_id &&
+            (change.best_bid !== undefined || change.best_ask !== undefined)
+          ) {
+            const bestBid = parseFloat(change.best_bid) || 0;
+            const bestAsk = parseFloat(change.best_ask) || 1;
+
+            // IMPORTANT: Ignore empty market prices (bid=0, ask=1 means no real liquidity)
+            const isEmptyMarket = bestBid <= 0.02 && bestAsk >= 0.98;
+            if (isEmptyMarket) {
+              // Don't log every empty market update - too spammy
+              continue;
+            }
+
+            ctx.priceCache[change.asset_id] = {
+              bestBid,
+              bestAsk,
+              lastUpdate: Date.now(),
+            };
+            // Log if this is the hedge token (opposite of filled)
+            if (
+              ctx.oppositeTokenId &&
+              change.asset_id === ctx.oppositeTokenId
+            ) {
+              // console.log(
+              //   `[WS] HEDGE TOKEN price update: bid=$${bestBid.toFixed(2)}, ask=$${bestAsk.toFixed(2)}`,
+              // );
+            }
+            // console.log("[WS] The priceContext is", ctx.priceCache);
+          }
+        }
+      }
+    } catch (err) {
+      // Ignore parse errors for non-JSON messages (like ping/pong)
+      console.log("[WS] error", err);
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error("[WS] WebSocket error:", err.message);
+  });
+
+  ws.on("close", (code, reason) => {
+    console.log(`[WS] WebSocket closed: ${code} - ${reason}`);
+    ctx.priceWs = null;
+
+    // Auto-reconnect if we're still in a state that needs prices
+    if (ctx.state === "WATCHING" || ctx.state === "HEDGING") {
+      console.log("[WS] Reconnecting in 2 seconds...");
+      setTimeout(() => startPriceWebSocket(ctx), 2000);
+    }
+  });
+
+  ctx.priceWs = ws;
+}
+
+function stopPriceWebSocket(ctx: BotContext): void {
+  if (ctx.priceWs) {
+    console.log("[WS] Closing WebSocket connection...");
+    ctx.priceWs.close();
+    ctx.priceWs = null;
+  }
+}
+
+// Resubscribe WebSocket to new market tokens (called when entering a new market)
+// This unsubscribes from old tokens, clears cache, and subscribes to new tokens
+function resubscribeWebSocket(
+  ctx: BotContext,
+  oldYesToken?: string,
+  oldNoToken?: string,
+): void {
+  if (!ctx.priceWs || ctx.priceWs.readyState !== WebSocket.OPEN) {
+    console.log(
+      "[WS] WebSocket not connected, will subscribe when it connects",
+    );
+    // Clear stale cache from previous market
+    ctx.priceCache = {};
+    return;
+  }
+
+  const newTokenIds = [ctx.yesTokenId, ctx.noTokenId].filter(Boolean);
+  const oldTokenIds = [oldYesToken, oldNoToken].filter(Boolean);
+
+  // Unsubscribe from old tokens first
+  if (oldTokenIds.length > 0) {
+    console.log(
+      `[WS] Unsubscribing from old market tokens: ${oldTokenIds[0]?.slice(0, 8)}...`,
+    );
+    ctx.priceWs.send(
+      JSON.stringify({
+        assets_ids: oldTokenIds,
+        operation: "unsubscribe",
+      }),
+    );
+  }
+
+  // Clear price cache to remove stale prices from old market
+  console.log("[WS] Clearing price cache for new market...");
+  ctx.priceCache = {};
+
+  // Subscribe to new tokens
+  if (newTokenIds.length > 0) {
+    console.log(
+      `[WS] Subscribing to new market tokens: ${newTokenIds[0]?.slice(0, 8)}...`,
+    );
+    ctx.priceWs.send(
+      JSON.stringify({
+        assets_ids: newTokenIds,
+        operation: "subscribe",
+      }),
+    );
+  }
+}
+
+function getCachedPrice(
+  ctx: BotContext,
+  tokenId: string,
+): { bestBid: number; bestAsk: number; age: number } | null {
+  const cached = ctx.priceCache[tokenId];
+  if (!cached) return null;
+
+  // CRITICAL: Validate that this token belongs to the current market
+  // This prevents using stale prices from a previous market
+  if (tokenId !== ctx.yesTokenId && tokenId !== ctx.noTokenId) {
+    console.warn(
+      `[WS] Rejecting cached price for ${tokenId.slice(0, 8)}... - not in current market`,
+    );
+    return null;
+  }
+
+  return {
+    bestBid: cached.bestBid,
+    bestAsk: cached.bestAsk,
+    age: Date.now() - cached.lastUpdate,
+  };
 }
 
 // ============================================================================
@@ -434,6 +869,10 @@ async function handleStart(ctx: BotContext): Promise<BotState> {
     return "START";
   }
 
+  // Store old token IDs before updating (for WebSocket resubscription)
+  const oldYesToken = ctx.yesTokenId;
+  const oldNoToken = ctx.noTokenId;
+
   ctx.yesTokenId = tokenIds[0]; // First token = YES
   ctx.noTokenId = tokenIds[1]; // Second token = NO
 
@@ -442,17 +881,22 @@ async function handleStart(ctx: BotContext): Promise<BotState> {
   console.log(`[START] YES Token ID: ${ctx.yesTokenId}`);
   console.log(`[START] NO Token ID: ${ctx.noTokenId}`);
 
-  // 🎯 WAIT 3 MINUTES before placing orders (market stabilization)
-  console.log(
-    "[START] ⏳ Waiting 3 minutes before placing traps (market stabilization)...",
-  );
-  for (let i = 90; i > 0; i--) {
-    if (i % 30 === 0 || i <= 5) {
-      console.log(`[START] ⏳ Waiting ${i} seconds before placing traps...`);
-    }
-    await sleep(1000);
+  // NOTE: No wait - place traps immediately at market start when both tokens are ~$0.50
+  // This ensures we know exact trap fill price (CONFIG.TRAP_PRICE) for instant hedge calculation
+  console.log(`[START] Placing traps immediately (no stabilization wait)`);
+
+  // CRITICAL: Start or resubscribe WebSocket to new market tokens EARLY
+  // This gives time for the WebSocket to connect and receive initial book snapshots
+  // before a trap potentially fills
+  if (ctx.priceWs && ctx.priceWs.readyState === WebSocket.OPEN) {
+    // Already connected - just resubscribe to new tokens
+    resubscribeWebSocket(ctx, oldYesToken, oldNoToken);
+  } else {
+    // Not connected - start fresh connection
+    ctx.priceCache = {}; // Clear any stale cache
+    startPriceWebSocket(ctx);
   }
-  console.log("[START] ✅ 3-minute wait complete. Ready to place traps.");
+  await sleep(5000);
 
   // Cancel any stale orders from previous rounds
   try {
@@ -560,6 +1004,13 @@ async function handleWatching(ctx: BotContext): Promise<BotState> {
     `[WATCHING] Trap Orders: YES=${ctx.trapOrders[0]?.orderId}, NO=${ctx.trapOrders[1]?.orderId}`,
   );
 
+  // WebSocket should already be connected from handleStart
+  // Just verify it's still connected, reconnect if needed
+  if (!ctx.priceWs || ctx.priceWs.readyState !== WebSocket.OPEN) {
+    console.log("[WATCHING] WebSocket not connected, starting...");
+    startPriceWebSocket(ctx);
+  }
+
   const startTime = Date.now();
   const MAX_WATCH_TIME = 900000; // 15 minutes (full market duration)
   let lastLogTime = startTime;
@@ -645,48 +1096,31 @@ async function handleWatching(ctx: BotContext): Promise<BotState> {
               `[WATCHING] Original size: ${trapOrder.originalSize}, Size matched: ${trapOrder.sizeMatched}`,
             );
 
-            // CRITICAL: getOrder().price is the LIMIT price, NOT the execution price.
-            // Use associate_trades -> getTrades() to get ACTUAL execution prices.
-            const associateTrades: string[] =
-              filledOrderData.associate_trades || [];
-            if (associateTrades.length > 0) {
-              console.log(
-                `[WATCHING] Found ${associateTrades.length} associated trades. Fetching actual fill details...`,
-              );
-              const fillDetails = await getActualFillDetails(
-                ctx.client,
-                associateTrades,
-              );
-              trapOrder.sizeMatched =
-                fillDetails.totalSize > 0
-                  ? fillDetails.totalSize
-                  : trapOrder.sizeMatched;
-              trapOrder.avgFillPrice = fillDetails.avgFillPrice;
-              trapOrder.totalCost = fillDetails.totalCost;
-            } else {
-              console.warn(
-                `[WATCHING] No associate_trades found. Falling back to getOrder() limit price.`,
-              );
-              trapOrder.avgFillPrice = trapOrder.price;
-              trapOrder.totalCost = trapOrder.sizeMatched * trapOrder.price;
-            }
+            // FAST PATH: Use CONFIG values for immediate hedge calculation
+            // Since we place traps at market start, we know the fill price = CONFIG.TRAP_PRICE
+            // and size = CONFIG.BASE_SIZE. This avoids 15+ second wait for Positions API.
+            // We will fetch accurate position details AFTER hedge is placed.
+            trapOrder.avgFillPrice = CONFIG.TRAP_PRICE;
+            trapOrder.totalCost = CONFIG.BASE_SIZE * CONFIG.TRAP_PRICE;
 
-            console.log(`[WATCHING] ACTUAL fill details (from getTrades()):`);
+            console.log(
+              `[WATCHING] Using CONFIG values for INSTANT hedge calculation:`,
+            );
             console.log(`[WATCHING]   Token ID: ${trapOrder.tokenId}`);
             console.log(`[WATCHING]   Side: ${trapOrder.side}`);
             console.log(
-              `[WATCHING]   Size Matched: ${trapOrder.sizeMatched} shares`,
+              `[WATCHING]   Size: ${CONFIG.BASE_SIZE} shares (from CONFIG)`,
             );
             console.log(
-              `[WATCHING]   Limit Price: $${trapOrder.price} (what we proposed)`,
+              `[WATCHING]   Price: $${CONFIG.TRAP_PRICE} (from CONFIG)`,
             );
             console.log(
-              `[WATCHING]   Avg Fill Price: $${trapOrder.avgFillPrice.toFixed(4)} (actual execution)`,
-            );
-            console.log(
-              `[WATCHING]   Total Cost: $${trapOrder.totalCost.toFixed(4)} (actual USDC spent)`,
+              `[WATCHING]   Total Cost: $${trapOrder.totalCost.toFixed(4)}`,
             );
             console.log(`[WATCHING]   Outcome: ${trapOrder.outcome}`);
+            console.log(
+              `[WATCHING] Proceeding to HEDGE immediately - will fetch accurate positions after!`,
+            );
 
             ctx.filledOrder = trapOrder;
             ctx.filledTokenId = trapOrder.tokenId;
@@ -760,26 +1194,54 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
       `[HEDGING] Initial cost (actual from trades): $${initialCost.toFixed(4)}`,
     );
 
-    // Step 2: Fetch market info using conditionId to get token prices
-    const marketData = await ctx.client.getMarket(ctx.conditionId);
-    console.log(`[HEDGING] Market data fetched. Tokens:`, marketData.tokens);
+    // Step 2: Get hedge price - PREFER WebSocket cached price (real-time, no latency)
+    // Fall back to HTTP getMarket() only if WebSocket price is unavailable or stale
+    let hedgePrice: number;
+    let hedgeOutcome: string = "";
+    const MAX_PRICE_AGE_MS = 3000; // Consider WebSocket price stale after 3 seconds
 
-    // Find the hedge token in the market data
-    const hedgeToken = marketData.tokens.find(
-      (token: any) => token.token_id === ctx.oppositeTokenId,
-    );
+    // CRITICAL: Track which price source we're using - stick with it throughout hedging
+    // This prevents mixing stale WS cache with fresh HTTP prices
+    let useWebSocketPrices = false;
 
-    if (!hedgeToken) {
-      console.error(
-        `[HEDGING] Could not find hedge token ${ctx.oppositeTokenId} in market data`,
+    const cachedPrice = getCachedPrice(ctx, ctx.oppositeTokenId!);
+
+    if (cachedPrice && cachedPrice.age < MAX_PRICE_AGE_MS) {
+      // Use WebSocket price - this is the best ask (price to BUY at)
+      hedgePrice = cachedPrice.bestAsk;
+      useWebSocketPrices = true;
+      console.log(
+        `[HEDGING] Using REAL-TIME WebSocket price: $${hedgePrice} (age: ${cachedPrice.age}ms, bid: $${cachedPrice.bestBid})`,
       );
-      return "DONE";
+    } else {
+      // Fallback to HTTP polling - will use HTTP for ALL retries too
+      useWebSocketPrices = false;
+      console.log(
+        `[HEDGING] WebSocket price unavailable or stale (age: ${cachedPrice?.age || "N/A"}ms), using HTTP for all price fetches...`,
+      );
+      const marketData = await ctx.client.getMarket(ctx.conditionId);
+      console.log(
+        `[HEDGING] Market data fetched via HTTP. Tokens:`,
+        marketData.tokens,
+      );
+
+      const hedgeToken = marketData.tokens.find(
+        (token: any) => token.token_id === ctx.oppositeTokenId,
+      );
+
+      if (!hedgeToken) {
+        console.error(
+          `[HEDGING] Could not find hedge token ${ctx.oppositeTokenId} in market data`,
+        );
+        return "DONE";
+      }
+
+      hedgePrice = hedgeToken.price;
+      hedgeOutcome = hedgeToken.outcome;
     }
 
-    const hedgePrice = hedgeToken.price;
-
     console.log(
-      `[HEDGING] Current hedge token price: $${hedgePrice} (Outcome: ${hedgeToken.outcome})`,
+      `[HEDGING] Current hedge token price: $${hedgePrice}${hedgeOutcome ? ` (Outcome: ${hedgeOutcome})` : ""}`,
     );
 
     // Step 3: Safety check - if hedge price exceeds max, trigger stop loss
@@ -805,21 +1267,13 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
       `[HEDGING] Expected profit if hedge succeeds: $${CONFIG.MIN_PROFIT_USD.toFixed(2)}`,
     );
 
-    // Step 5: Cancel unfilled order first
-    if (unfilledOrder) {
-      console.log(
-        `[HEDGING] Canceling unfilled order: ${unfilledOrder.orderId}`,
-      );
-      try {
-        await ctx.client.cancelOrder({ orderID: unfilledOrder.orderId });
-        console.log(`[HEDGING] ✅ Unfilled order cancelled`);
-      } catch (e) {
-        console.warn("[HEDGING] Failed to cancel unfilled order:", e);
-      }
-    }
+    // NOTE: We place the hedge order FIRST, then cancel the unfilled trap order
+    // This minimizes time between price fetch and order placement
 
     // Place hedge order using FAK with RETRY LOOP until filled
     // FAK = Fill-And-Kill - fills immediately or fails, no partial fills sitting on book
+    // For BUY orders: amount = DOLLAR AMOUNT to spend (not share count!)
+    // For SELL orders: amount = number of shares to sell
     const hedgeSide = Side.BUY;
     const hedgeTokenId = ctx.oppositeTokenId!;
 
@@ -827,45 +1281,99 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
     let actualHedgeFilled = hedgeSize;
     let hedgeAttempts = 0;
     const MAX_HEDGE_ATTEMPTS = 30; // Try up to 30 times (about 60 seconds with 2s delays)
+    const MAX_SLIPPAGE_PERCENT = 0.1; // Max 10% slippage from fetched price
+
+    // Calculate dollar amount to spend for the hedge
+    // hedgeSize = number of shares we want, hedgePrice = price per share
+    const hedgeDollarAmount = hedgeSize * hedgePrice;
 
     console.log(
       `[HEDGING] Placing hedge order on opposite token: ${hedgeTokenId}`,
     );
     console.log(
-      `[HEDGING] Using FAK ORDER with retry loop until filled (max ${MAX_HEDGE_ATTEMPTS} attempts)`,
+      `[HEDGING] Target: ${hedgeSize} shares @ $${hedgePrice} = $${hedgeDollarAmount.toFixed(2)} to spend`,
+    );
+    console.log(
+      `[HEDGING] Using FAK ORDER with ${MAX_SLIPPAGE_PERCENT * 100}% max slippage protection`,
     );
 
     while (!hedgeFilled && hedgeAttempts < MAX_HEDGE_ATTEMPTS) {
       hedgeAttempts++;
 
       try {
-        // Fetch fresh market price each attempt
-        const freshMarketData = await ctx.client.getMarket(ctx.conditionId);
-        const freshHedgeToken = freshMarketData.tokens.find(
-          (token: any) => token.token_id === hedgeTokenId,
-        );
+        // Get fresh price - use SAME source as initial price fetch
+        // This prevents mixing stale WS cache with HTTP prices
+        let currentPrice: number;
 
-        if (!freshHedgeToken) {
-          console.error(`[HEDGING] Could not find hedge token in market data`);
-          await sleep(2000);
-          continue;
+        if (useWebSocketPrices) {
+          // We established WS is working - continue using it
+          const freshCachedPrice = getCachedPrice(ctx, hedgeTokenId);
+
+          if (freshCachedPrice && freshCachedPrice.age < MAX_PRICE_AGE_MS) {
+            currentPrice = freshCachedPrice.bestAsk;
+            console.log(
+              `[HEDGING] Attempt ${hedgeAttempts}/${MAX_HEDGE_ATTEMPTS}: Using WS price $${currentPrice} (age: ${freshCachedPrice.age}ms)`,
+            );
+          } else {
+            // WS became stale mid-hedging, fall back to HTTP for this attempt
+            console.log(
+              `[HEDGING] Attempt ${hedgeAttempts}/${MAX_HEDGE_ATTEMPTS}: WS price became stale, fetching via HTTP...`,
+            );
+            const freshMarketData = await ctx.client.getMarket(ctx.conditionId);
+            const freshHedgeToken = freshMarketData.tokens.find(
+              (token: any) => token.token_id === hedgeTokenId,
+            );
+
+            if (!freshHedgeToken) {
+              console.error(
+                `[HEDGING] Could not find hedge token in market data`,
+              );
+              await sleep(2000);
+              continue;
+            }
+
+            currentPrice = freshHedgeToken.price;
+          }
+        } else {
+          // HTTP mode - always use HTTP, never check WS cache
+          console.log(
+            `[HEDGING] Attempt ${hedgeAttempts}/${MAX_HEDGE_ATTEMPTS}: Fetching price via HTTP...`,
+          );
+          const freshMarketData = await ctx.client.getMarket(ctx.conditionId);
+          const freshHedgeToken = freshMarketData.tokens.find(
+            (token: any) => token.token_id === hedgeTokenId,
+          );
+
+          if (!freshHedgeToken) {
+            console.error(
+              `[HEDGING] Could not find hedge token in market data`,
+            );
+            await sleep(2000);
+            continue;
+          }
+
+          currentPrice = freshHedgeToken.price;
         }
 
-        const currentPrice = freshHedgeToken.price;
-        // Set aggressive buy price: current price + 15% buffer, capped at 0.95
-        const aggressiveHedgePrice = Math.min(
-          0.95,
-          Math.round((currentPrice + 0.15) * 100) / 100,
+        // Slippage protection: max price we're willing to pay (current price + slippage buffer)
+        const maxPrice = Math.min(
+          CONFIG.MAX_HEDGE_PRICE,
+          Math.round(currentPrice * (1 + MAX_SLIPPAGE_PERCENT) * 100) / 100,
         );
 
+        // Recalculate dollar amount based on fresh price to get roughly the same shares
+        const freshDollarAmount =
+          Math.ceil(hedgeSize * currentPrice * 100) / 100;
+
         console.log(
-          `[HEDGING] Attempt ${hedgeAttempts}/${MAX_HEDGE_ATTEMPTS}: FAK market order for ${hedgeSize} shares (market price: $${currentPrice})`,
+          `[HEDGING] FAK BUY $${freshDollarAmount.toFixed(2)} worth (market: $${currentPrice}, max: $${maxPrice})`,
         );
 
         const hedgeResult = await ctx.client.createAndPostMarketOrder(
           {
             tokenID: hedgeTokenId,
-            amount: hedgeSize,
+            amount: freshDollarAmount, // Dollar amount to spend (for BUY orders)
+            price: maxPrice, // Slippage protection - won't fill above this price
             side: hedgeSide,
           },
           {
@@ -905,47 +1413,19 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
               (hedgeDetails as any).size_matched || hedgeSize;
             actualHedgeFilled = parseFloat(filledAmount) || hedgeSize;
 
-            // Get actual hedge execution price from trades
-            const hedgeAssociateTrades: string[] =
-              (hedgeDetails as any).associate_trades || [];
-            if (hedgeAssociateTrades.length > 0) {
-              console.log(
-                `[HEDGING] Fetching actual hedge fill details from ${hedgeAssociateTrades.length} trades...`,
-              );
-              const hedgeFillDetails = await getActualFillDetails(
-                ctx.client,
-                hedgeAssociateTrades,
-              );
-              if (hedgeFillDetails.totalSize > 0) {
-                actualHedgeFilled = hedgeFillDetails.totalSize;
-                ctx.hedgePrice = hedgeFillDetails.avgFillPrice;
-                ctx.hedgeSize = actualHedgeFilled;
-                console.log(
-                  `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}!`,
-                );
-                console.log(
-                  `[HEDGING]   Actual size: ${actualHedgeFilled} shares`,
-                );
-                console.log(
-                  `[HEDGING]   Avg fill price: $${ctx.hedgePrice.toFixed(4)} (market was $${currentPrice})`,
-                );
-                console.log(
-                  `[HEDGING]   Total hedge cost: $${hedgeFillDetails.totalCost.toFixed(4)}`,
-                );
-              } else {
-                ctx.hedgeSize = actualHedgeFilled;
-                ctx.hedgePrice = currentPrice;
-                console.log(
-                  `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares (trades returned no data, using market price $${currentPrice})`,
-                );
-              }
-            } else {
-              ctx.hedgeSize = actualHedgeFilled;
-              ctx.hedgePrice = currentPrice;
-              console.log(
-                `[HEDGING] HEDGE FILLED on attempt ${hedgeAttempts}! ${actualHedgeFilled} shares (no associate_trades, using market price $${currentPrice})`,
-              );
-            }
+            // FAST PATH: Use calculated values for now, will fetch accurate positions later
+            ctx.hedgeSize = actualHedgeFilled;
+            ctx.hedgePrice = currentPrice; // Use market price for now
+            console.log(
+              `[HEDGING] HEDGE ORDER MATCHED on attempt ${hedgeAttempts}!`,
+            );
+            console.log(
+              `[HEDGING]   Estimated size: ${actualHedgeFilled} shares`,
+            );
+            console.log(`[HEDGING]   Market price: $${currentPrice}`);
+            console.log(
+              `[HEDGING] Will fetch accurate position details after hedge settles...`,
+            );
             break;
           }
         }
@@ -962,6 +1442,23 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
 
     // Store actual filled amount for later use
     ctx.hedgeSize = actualHedgeFilled;
+
+    // NOW cancel the unfilled trap order (after hedge is placed/filled)
+    // This ordering ensures minimal delay between price fetch and hedge placement
+    if (unfilledOrder) {
+      console.log(
+        `[HEDGING] Canceling unfilled trap order: ${unfilledOrder.orderId}`,
+      );
+      try {
+        await ctx.client.cancelOrder({ orderID: unfilledOrder.orderId });
+        console.log(`[HEDGING] Unfilled trap order cancelled`);
+      } catch (e) {
+        console.warn(
+          "[HEDGING] Failed to cancel unfilled order (may already be filled or cancelled):",
+          e,
+        );
+      }
+    }
 
     // CRITICAL: Verify hedge order actually filled
     if (!hedgeFilled) {
@@ -1065,29 +1562,92 @@ async function handleHedging(ctx: BotContext): Promise<BotState> {
       return "DONE";
     }
 
-    // ctx.hedgeSize and ctx.hedgePrice are already set from getTrades() in the fill detection block above
-    // No need to overwrite with calculated/market values
-
-    // Wait for token settlement before placing sell orders
+    // NOW fetch accurate position details for BOTH tokens from Positions API
+    // This is done AFTER hedge is placed to avoid the 15+ second delay during hedging
     console.log(
-      "[HEDGING] Waiting 4 seconds for hedge tokens to settle in wallet...",
+      "[HEDGING] Now fetching accurate position details for BOTH tokens from Positions API...",
     );
-    await sleep(4000);
+    console.log(
+      "[HEDGING] This may take 15-30 seconds as positions settle in the API...",
+    );
 
-    // Send Telegram notification with actual costs and fills
-    const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
+    // Fetch TRAP position details
+    const trapPositionDetails = await getPositionDetails(
+      ctx.conditionId,
+      ctx.filledTokenId!,
+      15, // maxRetries
+      3000, // retryDelayMs
+    );
+
+    if (trapPositionDetails && trapPositionDetails.size > 0) {
+      ctx.filledOrder!.sizeMatched = trapPositionDetails.size;
+      ctx.filledOrder!.avgFillPrice = trapPositionDetails.avgPrice;
+      ctx.filledOrder!.totalCost = trapPositionDetails.totalCost;
+      console.log(`[HEDGING] TRAP position details:`);
+      console.log(`[HEDGING]   Size: ${trapPositionDetails.size} shares`);
+      console.log(
+        `[HEDGING]   Avg Price: $${trapPositionDetails.avgPrice.toFixed(4)}`,
+      );
+      console.log(
+        `[HEDGING]   Total Cost: $${trapPositionDetails.totalCost.toFixed(4)}`,
+      );
+    } else {
+      console.warn(
+        `[HEDGING] Could not fetch trap position, using CONFIG values`,
+      );
+      // Keep the CONFIG values we set in WATCHING state
+    }
+
+    // Fetch HEDGE position details
+    const hedgePositionDetails = await getPositionDetails(
+      ctx.conditionId,
+      ctx.oppositeTokenId!,
+      15, // maxRetries
+      3000, // retryDelayMs
+    );
+
+    if (hedgePositionDetails && hedgePositionDetails.size > 0) {
+      ctx.hedgeSize = hedgePositionDetails.size;
+      ctx.hedgePrice = hedgePositionDetails.avgPrice;
+      console.log(`[HEDGING] HEDGE position details:`);
+      console.log(`[HEDGING]   Size: ${ctx.hedgeSize} shares`);
+      console.log(`[HEDGING]   Avg Price: $${ctx.hedgePrice.toFixed(4)}`);
+      console.log(
+        `[HEDGING]   Total Cost: $${hedgePositionDetails.totalCost.toFixed(4)}`,
+      );
+    } else {
+      console.warn(
+        `[HEDGING] Could not fetch hedge position, using estimated values`,
+      );
+      // Keep the estimated values we set when hedge matched
+    }
+
+    // Update metrics with actual trap cost
+    const actualTrapCost = ctx.filledOrder!.totalCost;
+    // Recalculate metrics.totalInvested with accurate value
+    // (We added trapCost earlier using CONFIG values, adjust if different)
+    const costDifference = actualTrapCost - trapCost;
+    if (costDifference !== 0) {
+      metrics.totalInvested += costDifference;
+      console.log(
+        `[HEDGING] Adjusted totalInvested by $${costDifference.toFixed(4)}`,
+      );
+    }
+
+    // Send Telegram notification with ACTUAL costs and fills
+    const actualHedgeCost = ctx.hedgeSize * ctx.hedgePrice;
     await sendTelegramMessage(
       `
-        ✅ <b>TRAP FILLED & HEDGE PLACED</b>
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━
-        💰 Trap Entry: ${ctx.filledOrder.outcome} @ $${ctx.filledOrder.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder.sizeMatched} = $${trapCost.toFixed(4)}
-        🛡️ Hedge Entry: ${ctx.oppositeTokenId === ctx.yesTokenId ? "YES" : "NO"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize} = $${hedgeCost.toFixed(4)}
+      ✅ <b>TRAP FILLED & HEDGE PLACED</b>
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    💰 Trap Entry: ${ctx.filledOrder!.outcome} @ $${ctx.filledOrder!.avgFillPrice.toFixed(4)} (avg fill) x ${ctx.filledOrder!.sizeMatched.toFixed(4)} = $${ctx.filledOrder!.totalCost.toFixed(4)}
+    🛡️ Hedge Entry: ${ctx.oppositeTokenId === ctx.yesTokenId ? "YES" : "NO"} @ $${ctx.hedgePrice.toFixed(4)} (avg fill) x ${ctx.hedgeSize.toFixed(4)} = $${actualHedgeCost.toFixed(4)}
 
-        💵 Total Invested: $${(trapCost + hedgeCost).toFixed(2)}
-        🎯 Expected Profit: <b>+$${CONFIG.MIN_PROFIT_USD.toFixed(2)}</b>
+    💵 Total Invested: $${(ctx.filledOrder!.totalCost + actualHedgeCost).toFixed(2)}
+    🎯 Expected Profit: <b>+$${CONFIG.MIN_PROFIT_USD.toFixed(2)}</b>
 
-        ✅ Position is now DELTA-NEUTRAL
-            `.trim(),
+    ✅ Position is now DELTA-NEUTRAL
+      `.trim(),
     );
 
     return "PROFIT_TAKING";
@@ -1106,9 +1666,9 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
     return "DONE";
   }
 
-  const EXIT_PRICE = 0.98;
-  const trapCost = ctx.filledOrder!.totalCost; // Actual USDC spent (from getTrades)
-  const hedgeCost = ctx.hedgeSize * ctx.hedgePrice; // Actual hedge cost (hedgePrice from getTrades)
+  const EXIT_PRICE = 0.96;
+  const trapCost = ctx.filledOrder!.totalCost;
+  const hedgeCost = ctx.hedgeSize * ctx.hedgePrice;
 
   console.log(
     "\n[PROFIT_TAKING] 📋 Placing limit orders to exit both positions",
@@ -1121,15 +1681,29 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
   );
 
   try {
-    // 🎯 CRITICAL: Wait for token settlement before placing sell orders
+    // CRITICAL: Wait for token settlement before placing sell orders
+    // On-chain settlement can take 30-60+ seconds after MATCHED status
     console.log(
-      "[PROFIT_TAKING] ⏳ Waiting 10 seconds for tokens to settle before placing sell orders...",
+      "[PROFIT_TAKING] Waiting 60 seconds for tokens to settle on-chain before placing sell orders...",
     );
-    await sleep(10000);
+    await sleep(5000);
+
+    // CRITICAL: Floor the sizes to avoid precision issues
+    // The CLOB uses 6 decimal places, but floating point can cause issues
+    const hedgeSellSize = Math.floor(ctx.hedgeSize * 1000000) / 1000000;
+    const trapSellSize =
+      Math.floor(ctx.filledOrder!.sizeMatched * 1000000) / 1000000;
+
+    console.log(
+      `[PROFIT_TAKING] Hedge size: ${ctx.hedgeSize} -> ${hedgeSellSize} (floored)`,
+    );
+    console.log(
+      `[PROFIT_TAKING] Trap size: ${ctx.filledOrder!.sizeMatched} -> ${trapSellSize} (floored)`,
+    );
 
     // Place sell limit order for hedge token @ 0.98
     console.log(
-      `[PROFIT_TAKING] Placing hedge sell limit order (${ctx.hedgeSize} @ $${EXIT_PRICE})...`,
+      `[PROFIT_TAKING] Placing hedge sell limit order (${hedgeSellSize} @ $${EXIT_PRICE})...`,
     );
     let hedgeSellOrderId: string | undefined;
     try {
@@ -1137,7 +1711,7 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
         {
           tokenID: ctx.oppositeTokenId,
           price: EXIT_PRICE,
-          size: ctx.hedgeSize,
+          size: hedgeSellSize,
           side: Side.SELL,
         },
         {
@@ -1158,12 +1732,12 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
       );
     }
 
-    // Wait 10seconds more before placing trap sell
-    await sleep(10000);
+    // Wait 3 seconds more before placing trap sell
+    await sleep(3000);
 
-    // Place sell limit order for trap token @ 0.98
+    // Place sell limit order for trap token @ 0.95
     console.log(
-      `[PROFIT_TAKING] Placing trap sell limit order (${ctx.filledOrder!.sizeMatched} @ $${EXIT_PRICE})...`,
+      `[PROFIT_TAKING] Placing trap sell limit order (${trapSellSize} @ $${EXIT_PRICE})...`,
     );
     let trapSellOrderId: string | undefined;
     try {
@@ -1171,7 +1745,7 @@ async function handleProfitTaking(ctx: BotContext): Promise<BotState> {
         {
           tokenID: ctx.filledTokenId!,
           price: EXIT_PRICE,
-          size: ctx.filledOrder!.sizeMatched,
+          size: trapSellSize,
           side: Side.SELL,
         },
         {
@@ -1570,10 +2144,10 @@ async function getMarketInfo(baseSlugPrefix = "btc-updown-15m") {
   console.log(`Derived current slug: ${slug}`);
 
   try {
-    const response = await fetch(
+    const response = await axios.get(
       `${GAMMA_API}/markets?slug=${slug}&active=true`,
     );
-    const markets = await response.json();
+    const markets = response.data;
     if (markets && markets.length > 0) {
       return markets[0];
     }
@@ -1598,8 +2172,10 @@ async function waitForMarketResolution(
 
   while (Date.now() - startTime < maxWaitMs) {
     try {
-      const response = await fetch(`${GAMMA_API}/markets?slug=${marketSlug}`);
-      const markets = await response.json();
+      const response = await axios.get(
+        `${GAMMA_API}/markets?slug=${marketSlug}`,
+      );
+      const markets = response.data;
 
       if (markets && markets.length > 0) {
         const market = markets[0];
@@ -1652,10 +2228,10 @@ async function waitForNextMarketActivation(
       // Re-derive slug in case we've crossed into the next interval
       nextSlug = deriveNextMarketSlug(baseSlugPrefix, 900);
 
-      const response = await fetch(
+      const response = await axios.get(
         `${GAMMA_API}/markets?slug=${nextSlug}&active=true`,
       );
-      const markets = await response.json();
+      const markets = response.data;
 
       if (markets && markets.length > 0) {
         const market = markets[0];
@@ -1729,6 +2305,9 @@ async function main() {
     hedgeSize: 0,
     hedgePrice: 0,
     state: "START",
+    // WebSocket for real-time price updates
+    priceWs: null,
+    priceCache: {},
   };
 
   console.log("=".repeat(80));
@@ -1756,6 +2335,9 @@ async function main() {
         ctx.state = await executeStateMachine(ctx);
       }
 
+      // Clean up WebSocket connection
+      stopPriceWebSocket(ctx);
+
       // Reset for next cycle
       ctx.conditionId = "";
       ctx.state = "START";
@@ -1766,13 +2348,16 @@ async function main() {
       ctx.hedgeOrderId = null;
       ctx.hedgeSize = 0;
       ctx.hedgePrice = 0;
+      ctx.priceCache = {}; // Clear price cache for new market
 
       // Wait before starting next cycle
       console.log("\nWaiting for next cycle...");
       await sleep(10000);
     } catch (error) {
       console.error("Unexpected error in bot loop:", error);
+      stopPriceWebSocket(ctx); // Clean up on error too
       ctx.state = "START";
+      ctx.priceCache = {};
       await sleep(10000);
     }
   }
