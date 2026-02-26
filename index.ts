@@ -122,26 +122,36 @@ const metrics: TradingMetrics = {
 
 // ============================================================================
 // HELPER: HEDGE MATH CALCULATION
+// UPDATED: Now includes slippage buffer to account for real transaction costs
 // ============================================================================
 function calculateHedgeSize(
   initialCost: number,
   hedgePrice: number,
   targetProfit: number,
 ): number {
-  // Math Derivation:
-  // Revenue = HedgeSize * $1.00 (since binary token settles to $0 or $1)
-  // TotalCost = InitialCost + (HedgeSize * HedgePrice)
-  // Revenue - TotalCost = TargetProfit
-  // HedgeSize - (InitialCost + HedgeSize * HedgePrice) = TargetProfit
-  // HedgeSize * (1 - HedgePrice) = InitialCost + TargetProfit
-  // HedgeSize = (InitialCost + TargetProfit) / (1 - HedgePrice)
+  // CRITICAL: Account for slippage in the calculation
+  // We use slippage tolerance in FAK orders, so assume we pay ~10% more than ask
+  const SLIPPAGE_BUFFER = 1.1; // 10% expected slippage cost
+  const effectiveHedgePrice = Math.min(0.98, hedgePrice * SLIPPAGE_BUFFER);
 
-  if (hedgePrice >= 1.0) {
-    throw new Error("Hedge price must be less than 1.0");
+  // Math Derivation (with slippage):
+  // Revenue = HedgeSize * $1.00 (since binary token settles to $0 or $1)
+  // TotalCost = InitialCost + (HedgeSize * effectiveHedgePrice)
+  // Revenue - TotalCost = TargetProfit
+  // HedgeSize - (InitialCost + HedgeSize * effectiveHedgePrice) = TargetProfit
+  // HedgeSize * (1 - effectiveHedgePrice) = InitialCost + TargetProfit
+  // HedgeSize = (InitialCost + TargetProfit) / (1 - effectiveHedgePrice)
+
+  if (effectiveHedgePrice >= 1.0) {
+    throw new Error("Effective hedge price must be less than 1.0");
   }
 
   const calculatedSize = Math.ceil(
-    (initialCost + targetProfit) / (1 - hedgePrice),
+    (initialCost + targetProfit) / (1 - effectiveHedgePrice),
+  );
+
+  console.log(
+    `[HEDGE CALC] hedgePrice=$${hedgePrice.toFixed(2)} -> effectivePrice=$${effectiveHedgePrice.toFixed(2)} (${((SLIPPAGE_BUFFER - 1) * 100).toFixed(0)}% buffer)`,
   );
 
   // Polymarket minimum order size is 5 shares
@@ -153,6 +163,7 @@ function calculateHedgeSize(
 // HELPER: FLIP AMOUNT CALCULATION
 // When the "losing" token starts recovering (price > FLIP_TOKEN_BUY_PRICE),
 // we buy more of it to ensure profit regardless of which side wins.
+// UPDATED: Now includes slippage buffer to account for real transaction costs
 // ============================================================================
 function calculateFlipAmount(
   totalInvested: number,
@@ -160,21 +171,26 @@ function calculateFlipAmount(
   buyPrice: number,
   minProfit: number,
 ): number {
-  // Math Derivation:
+  // CRITICAL: Account for slippage in the calculation
+  // We use 15% slippage tolerance in FAK orders, so assume we pay ~10% more than ask
+  const SLIPPAGE_BUFFER = 1.1; // 10% expected slippage cost
+  const effectiveBuyPrice = Math.min(0.98, buyPrice * SLIPPAGE_BUFFER);
+
+  // Math Derivation (with slippage):
   // After flip, if THIS token wins:
   //   Revenue = (currentShares + X) * $1.00
-  //   Cost = totalInvested + (X * buyPrice)
+  //   Cost = totalInvested + (X * effectiveBuyPrice)  <-- use slippage-adjusted price
   //   Profit = Revenue - Cost >= minProfit
-  //   currentShares + X - totalInvested - X*buyPrice >= minProfit
-  //   X * (1 - buyPrice) >= minProfit + totalInvested - currentShares
-  //   X >= (minProfit + totalInvested - currentShares) / (1 - buyPrice)
+  //   currentShares + X - totalInvested - X*effectiveBuyPrice >= minProfit
+  //   X * (1 - effectiveBuyPrice) >= minProfit + totalInvested - currentShares
+  //   X >= (minProfit + totalInvested - currentShares) / (1 - effectiveBuyPrice)
 
-  if (buyPrice >= 1.0) {
-    throw new Error("Buy price must be less than 1.0");
+  if (effectiveBuyPrice >= 1.0) {
+    throw new Error("Effective buy price must be less than 1.0");
   }
 
   const numerator = minProfit + totalInvested - currentTokenShares;
-  const denominator = 1 - buyPrice;
+  const denominator = 1 - effectiveBuyPrice;
 
   // If numerator is negative, we already have enough shares - no flip needed
   if (numerator <= 0) {
@@ -185,6 +201,13 @@ function calculateFlipAmount(
   }
 
   const calculatedSize = Math.ceil(numerator / denominator);
+
+  console.log(
+    `[FLIP CALC] buyPrice=$${buyPrice.toFixed(2)} -> effectivePrice=$${effectiveBuyPrice.toFixed(2)} (${((SLIPPAGE_BUFFER - 1) * 100).toFixed(0)}% buffer)`,
+  );
+  console.log(
+    `[FLIP CALC] Need ${calculatedSize} shares to guarantee $${minProfit.toFixed(2)} profit`,
+  );
 
   // Polymarket minimum order size is 5 shares
   const MIN_ORDER_SIZE = 5;
