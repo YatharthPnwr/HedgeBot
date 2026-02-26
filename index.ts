@@ -1,5 +1,5 @@
 import { ClobClient } from "@polymarket/clob-client";
-import { Wallet, Contract, constants } from "ethers"; // v5.8.0
+import { Wallet } from "ethers"; // v5.8.0
 import * as dotenv from "dotenv";
 import { Side } from "@polymarket/clob-client";
 import { OrderType } from "@polymarket/clob-client";
@@ -8,65 +8,6 @@ import WebSocket from "ws";
 import axios from "axios";
 
 dotenv.config();
-
-// ============================================================================
-// CONTRACT ADDRESSES (Polygon Mainnet)
-// ============================================================================
-const POLYGON_CONTRACTS = {
-  exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-  negRiskExchange: "0xC5d563A36AE78145C45a50134d48A1215220f80a",
-  negRiskAdapter: "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
-  conditionalTokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
-  collateral: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e
-};
-
-// Minimal ABI for ERC1155 setApprovalForAll
-const CTF_ABI = [
-  {
-    constant: false,
-    inputs: [
-      { name: "operator", type: "address" },
-      { name: "approved", type: "bool" },
-    ],
-    name: "setApprovalForAll",
-    outputs: [],
-    type: "function",
-  },
-  {
-    constant: true,
-    inputs: [
-      { name: "owner", type: "address" },
-      { name: "operator", type: "address" },
-    ],
-    name: "isApprovedForAll",
-    outputs: [{ name: "", type: "bool" }],
-    type: "function",
-  },
-];
-
-// Minimal ABI for ERC20 approve
-const ERC20_ABI = [
-  {
-    constant: false,
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    name: "approve",
-    outputs: [{ name: "", type: "bool" }],
-    type: "function",
-  },
-  {
-    constant: true,
-    inputs: [
-      { name: "owner", type: "address" },
-      { name: "spender", type: "address" },
-    ],
-    name: "allowance",
-    outputs: [{ name: "", type: "uint256" }],
-    type: "function",
-  },
-];
 
 // ============================================================================
 // CONFIGURATION & CONSTANTS
@@ -168,6 +109,7 @@ interface TradingMetrics {
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 const metrics: TradingMetrics = {
   totalInvested: 0,
@@ -254,116 +196,6 @@ function calculateFlipAmount(
 // ============================================================================
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ============================================================================
-// HELPER: GET POSITION DETAILS FROM POSITIONS API
-// Uses the Polymarket Data API to get current position details for a specific token.
-// This is more reliable than getTrades() which returns the entire trade (all participants).
-// API: GET https://data-api.polymarket.com/positions?user={address}&market={conditionId}
-// NOTE: Positions don't appear instantly - the API has a delay, so we poll with retries.
-// ============================================================================
-async function getPositionDetails(
-  conditionId: string,
-  tokenId: string,
-  maxRetries: number = 4,
-  retryDelayMs: number = 2000,
-): Promise<{ size: number; avgPrice: number; totalCost: number } | null> {
-  const userAddress = process.env.FUNDER_ADDRESS;
-
-  if (!userAddress) {
-    console.error("[POSITION] FUNDER_ADDRESS not set in environment");
-    return null;
-  }
-
-  // Build URL with all required params (matching working curl command)
-  const url = new URL("https://data-api.polymarket.com/positions");
-  url.searchParams.set("user", userAddress);
-  url.searchParams.set("market", conditionId);
-  url.searchParams.set("sizeThreshold", "0"); // Include all positions, even tiny ones
-  url.searchParams.set("limit", "100");
-  url.searchParams.set("sortBy", "TOKENS");
-  url.searchParams.set("sortDirection", "DESC");
-
-  console.log(
-    `[POSITION] Fetching positions for user ${userAddress.slice(0, 10)}... market ${conditionId.slice(0, 10)}...`,
-  );
-  console.log(
-    `[POSITION] Will retry up to ${maxRetries} times with ${retryDelayMs}ms delay between attempts`,
-  );
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`[POSITION] Attempt ${attempt}/${maxRetries}...`);
-
-      const response = await axios.get(url.toString());
-      const positions = response.data;
-
-      if (!Array.isArray(positions)) {
-        console.warn(`[POSITION] Invalid response format (not an array)`);
-        await sleep(retryDelayMs);
-        continue;
-      }
-
-      if (positions.length === 0) {
-        console.log(
-          `[POSITION] No positions yet, waiting ${retryDelayMs}ms before retry...`,
-        );
-        await sleep(retryDelayMs);
-        continue;
-      }
-
-      // Find the position matching our specific token (asset)
-      const position = positions.find((p: any) => p.asset === tokenId);
-
-      if (!position) {
-        console.log(
-          `[POSITION] Position for token ${tokenId.slice(0, 10)}... not found yet`,
-        );
-        console.log(
-          `[POSITION] Available positions:`,
-          positions.map((p: any) => ({
-            asset: p.asset?.slice(0, 10) + "...",
-            size: p.size,
-            outcome: p.outcome,
-          })),
-        );
-        await sleep(retryDelayMs);
-        continue;
-      }
-
-      // Found the position!
-      const size = parseFloat(position.size) || 0;
-      const avgPrice = parseFloat(position.avgPrice) || 0;
-      const totalCost = parseFloat(position.initialValue) || size * avgPrice;
-
-      console.log(
-        `[POSITION] Found position for token ${tokenId.slice(0, 10)}... on attempt ${attempt}:`,
-      );
-      console.log(`[POSITION]   Size: ${size} shares`);
-      console.log(`[POSITION]   Avg Price: $${avgPrice.toFixed(4)}`);
-      console.log(
-        `[POSITION]   Total Cost (initialValue): $${totalCost.toFixed(4)}`,
-      );
-      console.log(`[POSITION]   Outcome: ${position.outcome}`);
-      console.log(`[POSITION]   Total Bought: ${position.totalBought}`);
-
-      return { size, avgPrice, totalCost };
-    } catch (error: any) {
-      console.error(
-        `[POSITION] Error on attempt ${attempt}:`,
-        error.message || error,
-      );
-      if (attempt < maxRetries) {
-        await sleep(retryDelayMs);
-      }
-    }
-  }
-
-  console.error(
-    `[POSITION] Failed to fetch position after ${maxRetries} attempts`,
-  );
-  return null;
 }
 
 // ============================================================================
@@ -479,74 +311,6 @@ async function sendTradeNotification(
   await sendTelegramMessage(message);
 }
 
-async function sendHedgeNotification(
-  hedgePrice: number,
-  hedgeSize: number,
-  expectedProfit: number,
-): Promise<void> {
-  const hedgeCost = hedgeSize * hedgePrice;
-  const message = `
-    🛡️ <b>HEDGE PLACED</b>
-    ━━━━━━━━━━━━━━━━━━━━━━━━━━
-    💰 Hedge Price: $${hedgePrice.toFixed(2)}
-    📈 Hedge Size: ${hedgeSize} shares
-    💵 Hedge Cost: $${hedgeCost.toFixed(2)}
-    🎯 Expected Profit: <b>+$${expectedProfit.toFixed(2)}</b>
-
-    ✅ Position is now DELTA-NEUTRAL
-    PROFIT GUARANTEED in BOTH outcomes!
-  `.trim();
-
-  await sendTelegramMessage(message);
-}
-
-async function sendPnLNotification(
-  market: string,
-  outcome: string,
-  trapPrice: number,
-  trapSize: number,
-  hedgePrice: number,
-  hedgeSize: number,
-  marketResult: "WIN" | "LOSS" | "PARTIAL",
-  pnl: number,
-): Promise<void> {
-  const trapInvested = trapSize * trapPrice;
-  const hedgeInvested = hedgeSize * hedgePrice;
-  const totalInvested = trapInvested + hedgeInvested;
-
-  metrics.totalPnL += pnl;
-  if (pnl > 0) {
-    metrics.winCount++;
-  } else {
-    metrics.lossCount++;
-  }
-
-  const message = `
-📊 <b>TRADE RESOLVED</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 Market: ${market}
-🎲 Trap Outcome: ${outcome}
-📉 Market Result: <b>${marketResult}</b>
-
-💵 Investment Details:
-• Trap: ${trapSize} @ $${trapPrice.toFixed(2)} = $${trapInvested.toFixed(2)}
-• Hedge: ${hedgeSize} @ $${hedgePrice.toFixed(2)} = $${hedgeInvested.toFixed(2)}
-• Total: $${totalInvested.toFixed(2)}
-
-💰 <b>PnL: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b>
-ROI: ${((pnl / totalInvested) * 100).toFixed(1)}%
-
-📊 <b>PORTFOLIO</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total Invested: $${metrics.totalInvested.toFixed(2)}
-Total PnL: <b>${metrics.totalPnL >= 0 ? "+" : ""}$${metrics.totalPnL.toFixed(2)}</b>
-Wins: ${metrics.winCount} | Losses: ${metrics.lossCount}
-Win Rate: ${((metrics.winCount / (metrics.winCount + metrics.lossCount)) * 100).toFixed(1)}%
-  `.trim();
-
-  await sendTelegramMessage(message);
-}
-
 async function sendStatsNotification(): Promise<void> {
   const message = `
 📊 <b>BOT STATISTICS</b>
@@ -564,99 +328,6 @@ Total ROI: ${((metrics.totalPnL / (metrics.totalInvested || 1)) * 100).toFixed(1
   `.trim();
 
   await sendTelegramMessage(message);
-}
-
-// ============================================================================
-// PHASE 0: ENSURE APPROVALS FOR SELLING TOKENS
-// Polymarket requires TWO types of approvals:
-// 1. USDC allowance to Exchange (for BUY orders) - you likely have this
-// 2. Conditional Token approval (setApprovalForAll) to Exchange (for SELL orders)
-// Without #2, SELL orders will fail with "not enough balance / allowance"
-// ============================================================================
-async function ensureApprovals(
-  signer: Wallet,
-  isNegRisk: boolean = false,
-): Promise<void> {
-  console.log("\n[APPROVALS] Checking onchain approvals for selling tokens...");
-
-  // Connect signer to Polygon RPC (use env var or fallback to reliable public RPC)
-  const rpcUrl = process.env.RPC_URL || "https://rpc.ankr.com/polygon";
-  console.log(`[APPROVALS] Using RPC: ${rpcUrl}`);
-  const provider = new (await import("ethers")).providers.JsonRpcProvider(
-    rpcUrl,
-  );
-  const connectedSigner = signer.connect(provider);
-
-  const ctfContract = new Contract(
-    POLYGON_CONTRACTS.conditionalTokens,
-    CTF_ABI,
-    connectedSigner,
-  );
-
-  // Determine which exchange to approve based on market type
-  const exchangeAddress = isNegRisk
-    ? POLYGON_CONTRACTS.negRiskExchange
-    : POLYGON_CONTRACTS.exchange;
-
-  console.log(`[APPROVALS] Checking approval for Exchange: ${exchangeAddress}`);
-  console.log(
-    `[APPROVALS] CTF Contract: ${POLYGON_CONTRACTS.conditionalTokens}`,
-  );
-  console.log(
-    `[APPROVALS] Signer address: ${await connectedSigner.getAddress()}`,
-  );
-
-  try {
-    // Check if already approved
-    const isApproved = await ctfContract.isApprovedForAll(
-      await connectedSigner.getAddress(),
-      exchangeAddress,
-    );
-
-    console.log(`[APPROVALS] Current approval status: ${isApproved}`);
-
-    if (!isApproved) {
-      console.log(
-        "[APPROVALS] Setting approval for Exchange to transfer conditional tokens...",
-      );
-      const tx = await ctfContract.setApprovalForAll(exchangeAddress, true, {
-        gasPrice: 50_000_000_000, // 50 gwei
-        gasLimit: 100_000,
-      });
-      console.log(`[APPROVALS] Approval transaction sent: ${tx.hash}`);
-      console.log("[APPROVALS] Waiting for confirmation...");
-      await tx.wait();
-      console.log("[APPROVALS] Approval confirmed!");
-    } else {
-      console.log("[APPROVALS] Already approved - no action needed");
-    }
-
-    // Also check neg risk exchange if using standard exchange
-    if (!isNegRisk) {
-      const isNegRiskApproved = await ctfContract.isApprovedForAll(
-        await connectedSigner.getAddress(),
-        POLYGON_CONTRACTS.negRiskExchange,
-      );
-
-      if (!isNegRiskApproved) {
-        console.log("[APPROVALS] Setting approval for NegRisk Exchange...");
-        const tx = await ctfContract.setApprovalForAll(
-          POLYGON_CONTRACTS.negRiskExchange,
-          true,
-          {
-            gasPrice: 50_000_000_000,
-            gasLimit: 100_000,
-          },
-        );
-        console.log(`[APPROVALS] NegRisk approval transaction: ${tx.hash}`);
-        await tx.wait();
-        console.log("[APPROVALS] NegRisk approval confirmed!");
-      }
-    }
-  } catch (error) {
-    console.error("[APPROVALS] Error setting approval:", error);
-    throw error;
-  }
 }
 
 // ============================================================================
@@ -724,7 +395,6 @@ async function initializeClient() {
 // we maintain a live WebSocket connection that streams price updates.
 // This gives us the most accurate price at the moment we need to hedge.
 // ============================================================================
-const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 function startPriceWebSocket(ctx: BotContext): void {
   if (ctx.priceWs) {
@@ -1004,7 +674,8 @@ async function handleStart(ctx: BotContext): Promise<BotState> {
     ctx.priceCache = {}; // Clear any stale cache
     startPriceWebSocket(ctx);
   }
-  await sleep(5000);
+  console.log("waiting 15 seconds before placing traps");
+  await sleep(15000);
 
   // Cancel any stale orders from previous rounds
   try {
