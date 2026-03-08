@@ -1,6 +1,6 @@
 // ============================================================================
-// STRAT2: 5-Minute Market Momentum Buy Strategy
-// Monitors multiple assets (BTC, ETH, SOL, XRP) on Polymarket 5-minute markets.
+// STRAT2: 15-Minute Market Momentum Buy Strategy
+// Monitors multiple assets (BTC, ETH, SOL, XRP) on Polymarket 15-minute markets.
 // Buys winning YES tokens at $0.99 when WS price hits $0.98, holds until
 // resolution, claims winnings via Builder Relayer (gasless).
 // Supports concurrent positions with configurable MAX_CONCURRENT_POSITIONS.
@@ -19,6 +19,7 @@ import WebSocket from "ws";
 import axios from "axios";
 import * as fs from "fs";
 import * as path from "path";
+import { RelayerTxType } from "@polymarket/builder-relayer-client";
 
 dotenv.config();
 
@@ -80,25 +81,25 @@ const CONFIG = {
   BUY_TRIGGER_PRICE: 0.98, // WS bid price that triggers a buy opportunity
   BUY_LIMIT_PRICE: 0.99, // GTC limit price for the buy order
   BASE_SIZE: 5, // Number of shares per buy order
-  STOP_LOSS_PRICE: 0.8, // If bid falls below this after buying, trigger stop-loss
+  STOP_LOSS_PRICE: 0.93, // If bid falls below this after buying, trigger stop-loss
   STOP_LOSS_DISCOUNT: 0.02, // Sell at 2% below current bid on stop-loss
   MAX_STOP_LOSS_ATTEMPTS: 30, // Max retries for stop-loss sell
   STOP_LOSS_FALLBACK_PRICE: 0.01, // GTC fallback after all aggressive attempts fail
 
   // -- Price difference filter (uses RTDS Chainlink WS prices) --
-  PRICE_DIFFERENCE: 50, // $50 for BTC (default, per-asset overrides below)
+  PRICE_DIFFERENCE: 100, // $50 for BTC (default, per-asset overrides below)
 
   // -- Multi-asset config -- , "eth", "sol", "xrp"
   ASSETS: ["btc"] as const,
   ASSET_SLUG_PREFIX: {
-    btc: "btc-updown-5m",
-    eth: "eth-updown-5m",
-    sol: "sol-updown-5m",
-    xrp: "xrp-updown-5m",
+    btc: "btc-updown-15m",
+    eth: "eth-updown-15m",
+    sol: "sol-updown-15m",
+    xrp: "xrp-updown-15m",
   } as Record<string, string>,
   // Minimum absolute price move per asset (USD) to qualify as buy opportunity
   ASSET_PRICE_DIFF: {
-    btc: 10,
+    btc: 90,
     eth: 5,
     sol: 0.5,
     xrp: 0.005,
@@ -120,7 +121,7 @@ const CONFIG = {
 
   // -- Concurrent positions --
   MAX_CONCURRENT_POSITIONS: 1,
-  INTERVAL_SECONDS: 300, // 5-minute markets
+  INTERVAL_SECONDS: 900, // 15-minute markets
 
   // -- Polling intervals --
   MAIN_LOOP_TICK_MS: 5, // 25ms main loop tick
@@ -260,7 +261,7 @@ interface BotContext {
   activePositions: ActivePosition[]; // Currently active positions
   processedConditionIds: Set<string>; // NEVER cleared - prevents reinvestment
   // -- Epoch tracking --
-  currentEpoch: number; // Current 5-min epoch timestamp
+  currentEpoch: number; // Current 15-min epoch timestamp
   // -- Token subscriptions --
   subscribedTokenIds: Set<string>; // Tokens currently subscribed on CLOB WS
 }
@@ -395,7 +396,7 @@ async function initializeClient(): Promise<ClobClient> {
 }
 
 // ============================================================================
-// MARKET SLUG DERIVATION (5-minute intervals)
+// MARKET SLUG DERIVATION (15-minute intervals)
 // ============================================================================
 function getCurrentEpoch(): number {
   const now = Math.floor(Date.now() / 1000);
@@ -487,7 +488,7 @@ async function checkMarketResolved(
       };
     }
 
-    // For 5-minute markets, closed=true or acceptingOrders=false
+    // For 15-minute markets, closed=true or acceptingOrders=false
     // may indicate resolution even before umaResolutionStatus updates
     if (closed || !acceptingOrders) {
       return {
@@ -744,22 +745,42 @@ function getCryptoPrice(ctx: BotContext, asset: string): number | null {
 }
 
 // ============================================================================
-// BINANCE REST API: Fetch spot price at epoch start
-// Called once per asset per epoch to snapshot the "target" start price
+// BINANCE REST API (fallback): Fetch the close of the prior 15-min candle.
+// Used ONLY when the Chainlink WebSocket price isn't available yet.
+// Polymarket resolves using the Chainlink BTC/USD oracle; we prefer the live
+// Chainlink WebSocket price snapshot for the epoch-start reference.
 // ============================================================================
-async function fetchBinancePrice(asset: string): Promise<number | null> {
+async function fetchBinancePriceFallback(
+  asset: string,
+  epochSeconds: number,
+): Promise<number | null> {
   const symbol = CONFIG.ASSET_BINANCE_SYMBOL[asset];
   if (!symbol) return null;
   try {
+    const epochMs = epochSeconds * 1000;
+    const intervalMs = CONFIG.INTERVAL_SECONDS * 1000;
+    // Close of the candle ending at epochMs = last traded price before epoch
+    const prevCandleStartMs = epochMs - intervalMs;
     const response = await axios.get(
-      `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`,
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&startTime=${prevCandleStartMs}&limit=1`,
     );
-    const price = parseFloat(response.data?.price);
-    if (isNaN(price) || price <= 0) return null;
-    return price;
+    const klines = response.data;
+    if (!Array.isArray(klines) || klines.length === 0) {
+      console.warn(
+        `[BINANCE] No kline returned for ${symbol} at ${new Date(prevCandleStartMs).toISOString()}`,
+      );
+      return null;
+    }
+    // kline[4] = close price
+    const closePrice = parseFloat(klines[0][4]);
+    if (isNaN(closePrice) || closePrice <= 0) return null;
+    console.log(
+      `[BINANCE] ${symbol} prior candle close (fallback): $${closePrice.toFixed(4)}`,
+    );
+    return closePrice;
   } catch (error: any) {
     console.error(
-      `[BINANCE] Failed to fetch ${symbol} price:`,
+      `[BINANCE] Failed to fetch kline for ${symbol}:`,
       error.message || error,
     );
     return null;
@@ -768,7 +789,7 @@ async function fetchBinancePrice(asset: string): Promise<number | null> {
 
 // ============================================================================
 // EPOCH MANAGEMENT
-// Snapshots crypto prices at the start of each 5-minute epoch
+// Snapshots crypto prices at the start of each 15-minute epoch
 // Epoch-start price: Binance REST API (authoritative spot price)
 // Current price: RTDS Chainlink WebSocket (for ongoing comparison)
 // ============================================================================
@@ -804,18 +825,74 @@ async function handleNewEpoch(ctx: BotContext): Promise<void> {
     }
   }
 
-  // Snapshot epoch-start prices from Binance REST API
+  // Snapshot epoch-start prices.
+  //
+  // Two cases:
+  //   prevEpoch === 0  →  Bot just started, detected mid-epoch.
+  //                       The live Chainlink price is NOT the epoch-start
+  //                       price — it's the current price, minutes later.
+  //                       Must use Binance to fetch the historical candle
+  //                       close at the actual epoch boundary.
+  //
+  //   prevEpoch > 0   →  Real epoch rollover while the bot was running.
+  //                       The live Chainlink WebSocket price IS the
+  //                       epoch-start price (captured right at the tick).
+  //                       Polymarket resolves using this same Chainlink feed,
+  //                       so snapshotting it here gives an exact match.
+  //                       Fall back to Binance only if the WS isn't ready.
+  const isFirstRun = prevEpoch === 0;
+
   for (const asset of CONFIG.ASSETS) {
-    const price = await fetchBinancePrice(asset);
-    if (price !== null) {
-      ctx.epochStartPrices[asset] = { price, epoch };
+    if (isFirstRun) {
+      // Mid-epoch start: need the historical boundary price from Binance
       console.log(
-        `[EPOCH] ${asset.toUpperCase()} Binance epoch start price: $${price.toFixed(4)}`,
+        `[EPOCH] First run — fetching historical epoch-start price for ${asset.toUpperCase()} from Binance...`,
       );
+      const price = await fetchBinancePriceFallback(asset, epoch);
+      if (price !== null) {
+        ctx.epochStartPrices[asset] = { price, epoch };
+        console.log(
+          `[EPOCH] ${asset.toUpperCase()} epoch start price (Binance historical): $${price.toFixed(4)}`,
+        );
+      } else {
+        // Binance failed too — last resort: use current Chainlink price with a warning
+        const chainlinkPrice = getCryptoPrice(ctx, asset);
+        if (chainlinkPrice !== null && chainlinkPrice > 0) {
+          ctx.epochStartPrices[asset] = { price: chainlinkPrice, epoch };
+          console.warn(
+            `[EPOCH] ${asset.toUpperCase()} epoch start price (Chainlink current — Binance unavailable): $${chainlinkPrice.toFixed(4)}. Price diff filter may be inaccurate for this epoch.`,
+          );
+        } else {
+          console.warn(
+            `[EPOCH] ${asset.toUpperCase()} epoch start price unavailable — will skip all buys this epoch.`,
+          );
+        }
+      }
     } else {
-      console.warn(
-        `[EPOCH] Failed to fetch Binance price for ${asset.toUpperCase()} at epoch start`,
-      );
+      // Epoch rollover: snapshot the live Chainlink price right at the boundary
+      const chainlinkPrice = getCryptoPrice(ctx, asset);
+      if (chainlinkPrice !== null && chainlinkPrice > 0) {
+        ctx.epochStartPrices[asset] = { price: chainlinkPrice, epoch };
+        console.log(
+          `[EPOCH] ${asset.toUpperCase()} epoch start price (Chainlink): $${chainlinkPrice.toFixed(4)}`,
+        );
+      } else {
+        // Chainlink WS not ready — fall back to Binance candle close
+        console.warn(
+          `[EPOCH] Chainlink price unavailable for ${asset.toUpperCase()}, falling back to Binance...`,
+        );
+        const price = await fetchBinancePriceFallback(asset, epoch);
+        if (price !== null) {
+          ctx.epochStartPrices[asset] = { price, epoch };
+          console.log(
+            `[EPOCH] ${asset.toUpperCase()} epoch start price (Binance fallback): $${price.toFixed(4)}`,
+          );
+        } else {
+          console.warn(
+            `[EPOCH] Failed to get epoch start price for ${asset.toUpperCase()}.`,
+          );
+        }
+      }
     }
   }
 
@@ -1547,8 +1624,9 @@ async function redeemWinnings(conditionId: string): Promise<boolean> {
     const relayClient = new RelayClient(
       CONFIG.RELAYER_URL,
       CONFIG.CHAIN_ID,
-      wallet as any,
+      wallet,
       builderConfig as any,
+      RelayerTxType.PROXY,
     );
     console.log(
       `[REDEEM] RelayClient ready (url=${CONFIG.RELAYER_URL}, chainId=${CONFIG.CHAIN_ID})`,
@@ -1657,7 +1735,7 @@ async function cleanupDonePositions(ctx: BotContext): Promise<void> {
 // ============================================================================
 async function main() {
   console.log("=".repeat(80));
-  console.log("STRAT2: 5-MINUTE MARKET MOMENTUM BOT");
+  console.log("STRAT2: 15-MINUTE MARKET MOMENTUM BOT");
   console.log("=".repeat(80));
   console.log("Configuration:");
   console.log(`  Buy trigger: $${CONFIG.BUY_TRIGGER_PRICE}`);
@@ -1710,7 +1788,7 @@ async function main() {
 
   // Rate limiting for Gamma API scans
   let lastScanTime = 0;
-  const SCAN_INTERVAL_MS = 2000; // Scan every 2 seconds
+  const SCAN_INTERVAL_MS = 1000; // Scan every 2 seconds
   let lastStatusLogTime = 0;
   const STATUS_LOG_INTERVAL_MS = 60000; // Log bot status summary every 60s
 
@@ -1742,11 +1820,17 @@ async function main() {
         );
       }
 
-      // Phase 1: Epoch management - snapshot prices from Binance at 5-min boundaries
+      // Phase 1: Epoch management - snapshot prices from Binance at 15-min boundaries
       await handleNewEpoch(ctx);
 
       // Phase 2: Scan for new buy opportunities (rate limited)
-      if (now - lastScanTime >= SCAN_INTERVAL_MS) {
+      // Skip while any position is HOLDING or STOP_LOSS: the Gamma REST call
+      // would stall the main loop and delay the WebSocket-driven stop-loss check.
+      // Scanning resumes automatically once those positions resolve/clear.
+      const isInCriticalState = ctx.activePositions.some(
+        (p) => p.state === "HOLDING" || p.state === "STOP_LOSS",
+      );
+      if (!isInCriticalState && now - lastScanTime >= SCAN_INTERVAL_MS) {
         lastScanTime = now;
         await scanForOpportunities(ctx);
       }
