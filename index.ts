@@ -160,6 +160,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 /** Per-position state machine states */
 type PositionState =
   | "BUYING" // GTC buy order placed, waiting for fill
+  | "POLLING_POSITIONS" // Fetch exact fill size from data API
   | "HOLDING" // Buy filled, waiting for resolution or stop-loss
   | "STOP_LOSS" // Stop-loss triggered, selling aggressively
   | "AWAIT_RESOLUTION" // Waiting for market to resolve
@@ -185,6 +186,7 @@ interface ActivePosition {
   stopLossAttempts: number;
   stopLossSellOrderId: string | null;
   lastOrderPollTime: number; // Throttle order status polls
+  lastPositionPollTime: number; // Throttle fetching exact position size
   lastResolutionPollTime: number; // Throttle resolution polls
   lastRedeemAttemptTime: number; // Throttle redeem retries
   marketResolved: boolean;
@@ -1106,6 +1108,7 @@ async function openPosition(
       stopLossAttempts: 0,
       stopLossSellOrderId: null,
       lastOrderPollTime: 0,
+      lastPositionPollTime: 0, // Used for POLLING_POSITIONS
       lastResolutionPollTime: 0,
       lastRedeemAttemptTime: 0,
       marketResolved: false,
@@ -1212,25 +1215,20 @@ async function tickPosition(
             // Use estimated cost
           }
 
-          pos.filledSize = sizeMatched;
+          pos.filledSize = sizeMatched; // Temporary estimate
           pos.filledCost = totalCost;
-          pos.state = "HOLDING";
+          pos.state = "POLLING_POSITIONS";
+          pos.lastPositionPollTime = 0; // Trigger immediate poll
 
           console.log(
-            `[TICK:${pos.id}] BUY FILLED: ${sizeMatched} shares @ ~$${(totalCost / sizeMatched).toFixed(4)} = $${totalCost.toFixed(4)}`,
+            `[TICK:${pos.id}] BUY FILLED: Estimated ${sizeMatched} shares @ ~$${(totalCost / sizeMatched).toFixed(4)}. Waiting for exact size from Data API...`,
           );
-
-          // Telegram: buy filled
-          await sendTelegramMessage(
-            `<b>BUY FILLED</b> \u{2705}\n` +
-              `Position: ${pos.id}\n` +
-              `Filled: ${sizeMatched} ${pos.boughtSide} shares\n` +
-              `Cost: $${totalCost.toFixed(4)}\n` +
-              `Avg price: $${(totalCost / sizeMatched).toFixed(4)}\n` +
-              `Now HOLDING until resolution or stop-loss ($${CONFIG.STOP_LOSS_PRICE}).`,
-          );
-        } else if (status === "CANCELED" || status === "CANCELLED") {
-          console.log(`[TICK:${pos.id}] Buy order cancelled externally.`);
+        } else if (
+          status === "CANCELED" ||
+          status === "CANCELLED" ||
+          status === "CANCELED_MARKET_RESOLVED"
+        ) {
+          console.log(`[TICK:${pos.id}] Buy order cancelled (${status}). Marking DONE.`);
           pos.state = "DONE";
         }
         // Otherwise still open, keep waiting
@@ -1239,6 +1237,60 @@ async function tickPosition(
           `[TICK:${pos.id}] Error polling buy order:`,
           error.message || error,
         );
+      }
+      break;
+    }
+
+    // ------------------------------------------------------------------
+    // POLLING_POSITIONS: Wait for user positions API to show exact size
+    // ------------------------------------------------------------------
+    case "POLLING_POSITIONS": {
+      // Poll every 3 seconds
+      if (now - pos.lastPositionPollTime < 3000) return;
+      pos.lastPositionPollTime = now;
+
+      // Give up after 18 seconds and proceed with the estimate
+      const elapsed = now - pos.createdAt;
+      if (elapsed > 18000) {
+        console.warn(`[TICK:${pos.id}] Exact position size not found after 60s, proceeding to HOLDING with estimate of ${pos.filledSize}.`);
+        pos.state = "HOLDING";
+        
+        await sendTelegramMessage(
+          `<b>BUY FILLED (ESTIMATED)</b> \u{2705}\n` +
+            `Position: ${pos.id}\n` +
+            `Estimated size: ${pos.filledSize} ${pos.boughtSide} shares (API delay)\n` +
+            `Now HOLDING until resolution or stop-loss.`,
+        );
+        break;
+      }
+
+      try {
+        console.log(`[TICK:${pos.id}] Polling data API for accurate shares...`);
+        const positions = await getUserPositions(pos.conditionId);
+        // Look for the correct outcome ("Yes" or "No")
+        const truePos = positions.find(
+          (p) => p.outcome.toUpperCase() === pos.boughtSide,
+        );
+
+        if (truePos && truePos.size > 0) {
+          // WE FOUND IT! Update to the EXACT size returned by the API
+          pos.filledSize = truePos.size;
+          pos.state = "HOLDING";
+
+          console.log(
+            `[TICK:${pos.id}] EXACT SIZE FOUND: ${pos.filledSize} shares (moving to HOLDING)`,
+          );
+
+          await sendTelegramMessage(
+            `<b>BUY FILLED & CONFIRMED</b> \u{2705}\n` +
+              `Position: ${pos.id}\n` +
+              `Exact balance: ${pos.filledSize} ${pos.boughtSide} shares\n` +
+              `Cost: $${pos.filledCost.toFixed(4)}\n` +
+              `Now HOLDING until resolution or stop-loss ($${CONFIG.STOP_LOSS_PRICE}).`,
+          );
+        }
+      } catch (err: any) {
+        console.error(`[TICK:${pos.id}] Error polling user positions:`, err.message || err);
       }
       break;
     }
