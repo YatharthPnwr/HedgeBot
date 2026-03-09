@@ -79,10 +79,10 @@ console.error = (...args: any[]) => {
 const CONFIG = {
   // -- Trading --
   BUY_TRIGGER_PRICE: 0.98, // WS bid price that triggers a buy opportunity
-  BUY_LIMIT_PRICE: 0.99, // GTC limit price for the buy order
+  BUY_LIMIT_PRICE: 0.98, // GTC limit price for the buy order
   BASE_SIZE: 5, // Number of shares per buy order
-  STOP_LOSS_PRICE: 0.93, // If bid falls below this after buying, trigger stop-loss
-  STOP_LOSS_DISCOUNT: 0.02, // Sell at 2% below current bid on stop-loss
+  STOP_LOSS_PRICE: 0.95, // If bid falls below this after buying, trigger stop-loss
+  STOP_LOSS_DISCOUNT: 0.01, // Sell at 2% below current bid on stop-loss
   MAX_STOP_LOSS_ATTEMPTS: 30, // Max retries for stop-loss sell
   STOP_LOSS_FALLBACK_PRICE: 0.01, // GTC fallback after all aggressive attempts fail
 
@@ -259,7 +259,6 @@ interface BotContext {
   epochStartPrices: EpochStartPrices; // Snapshot at each epoch start
   // -- Positions --
   activePositions: ActivePosition[]; // Currently active positions
-  processedConditionIds: Set<string>; // NEVER cleared - prevents reinvestment
   // -- Epoch tracking --
   currentEpoch: number; // Current 15-min epoch timestamp
   // -- Token subscriptions --
@@ -959,14 +958,6 @@ async function scanForOpportunities(ctx: BotContext): Promise<void> {
       continue;
     }
 
-    // Check processed condition IDs (never reinvest)
-    if (ctx.processedConditionIds.has(market.conditionId)) {
-      console.log(
-        `[SCAN] ${asset.toUpperCase()} - conditionId ${market.conditionId.slice(0, 16)}... already processed (no reinvest), skipping`,
-      );
-      continue;
-    }
-
     // Ensure tokens are subscribed on CLOB WS
     subscribeMarketTokens(ctx, [market.yesTokenId, market.noTokenId]);
 
@@ -1055,8 +1046,6 @@ async function scanForOpportunities(ctx: BotContext): Promise<void> {
     // Open position
     await openPosition(ctx, asset, market, best.tokenId, best.side, epoch);
 
-    // Mark as processed immediately
-    ctx.processedConditionIds.add(market.conditionId);
     break; // One new position per scan cycle to avoid rate limits
   }
 }
@@ -1764,7 +1753,6 @@ async function main() {
     cryptoPriceCache: {},
     epochStartPrices: {},
     activePositions: [],
-    processedConditionIds: new Set(),
     currentEpoch: 0,
     subscribedTokenIds: new Set(),
   };
@@ -1814,7 +1802,7 @@ async function main() {
           return `${a.toUpperCase()}=${p ? "$" + p.toFixed(2) : "N/A"}`;
         }).join(", ");
         console.log(
-          `[STATUS] epoch=${ctx.currentEpoch}, positions=[${posDetails}], processed=${ctx.processedConditionIds.size}, ` +
+          `[STATUS] epoch=${ctx.currentEpoch}, positions=[${posDetails}], ` +
             `marketWS=${wsMarketState}, cryptoWS=${wsCryptoState}, subscribed=${ctx.subscribedTokenIds.size} tokens, ` +
             `prices: ${cryptoPrices}, PnL=$${metrics.totalPnL.toFixed(2)}, W=${metrics.winCount}/L=${metrics.lossCount}`,
         );
